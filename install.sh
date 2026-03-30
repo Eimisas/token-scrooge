@@ -10,7 +10,7 @@ BINARY_NAME="scrooge"
 INSTALL_DIR="${HOME}/.local/bin"
 REPO="Eimisas/scrooge"    # ← update this before publishing
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 info()    { echo -e "${BOLD}${GREEN}[scrooge]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[scrooge]${NC} $*"; }
 die()     { echo -e "${RED}[scrooge] error:${NC} $*" >&2; exit 1; }
@@ -34,13 +34,22 @@ esac
 PLATFORM="${OS_SLUG}-${ARCH_SLUG}"
 
 # ─── Install from source if Cargo is available and we're in the repo ──────────
-if [[ -f "Cargo.toml" ]] && grep -q 'name = "scrooge"' Cargo.toml 2>/dev/null; then
+# Detect whether we're at the repo root (install.sh location) or inside scrooge/
+if [[ -f "scrooge/Cargo.toml" ]] && grep -q 'name = "scrooge"' scrooge/Cargo.toml 2>/dev/null; then
+  SOURCE_DIR="scrooge"
+elif [[ -f "Cargo.toml" ]] && grep -q 'name = "scrooge"' Cargo.toml 2>/dev/null; then
+  SOURCE_DIR="."
+else
+  SOURCE_DIR=""
+fi
+
+if [[ -n "$SOURCE_DIR" ]]; then
   info "Building from source…"
   if ! command -v cargo &>/dev/null; then
     die "cargo not found. Install Rust from https://rustup.rs or download a pre-built binary."
   fi
-  cargo build --release
-  BINARY="target/release/${BINARY_NAME}"
+  cargo build --release --manifest-path "${SOURCE_DIR}/Cargo.toml"
+  BINARY="${SOURCE_DIR}/target/release/${BINARY_NAME}"
 
 # ─── Download pre-built binary from GitHub Releases ──────────────────────────
 elif command -v curl &>/dev/null; then

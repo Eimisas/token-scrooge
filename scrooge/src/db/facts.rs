@@ -323,7 +323,12 @@ fn ts_to_dt(ts: i64) -> DateTime<Utc> {
 
 /// Tokenise a query into safe FTS5 prefix-search terms (`token*`).
 /// Returns an empty Vec if no valid tokens exist.
+///
+/// FTS5 reserved keywords (AND, OR, NOT, NEAR) are dropped: appending `*`
+/// to them causes a parse error because FTS5 sees e.g. `NEAR*` as the
+/// proximity-search keyword followed by an unexpected `*`.
 fn fts_tokens(query: &str) -> Vec<String> {
+    const FTS5_KEYWORDS: &[&str] = &["and", "or", "not", "near"];
     query
         .split_whitespace()
         .filter_map(|w| {
@@ -331,7 +336,9 @@ fn fts_tokens(query: &str) -> Vec<String> {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
-            if clean.is_empty() { None } else { Some(format!("{}*", clean)) }
+            if clean.is_empty() { return None; }
+            if FTS5_KEYWORDS.contains(&clean.to_ascii_lowercase().as_str()) { return None; }
+            Some(format!("{}*", clean))
         })
         .collect()
 }
@@ -436,7 +443,10 @@ mod tests {
     #[test]
     fn fts_tokenisation() {
         assert_eq!(fts_tokens("login bug"), vec!["login*", "bug*"]);
-        assert_eq!(fts_tokens("AND OR"), vec!["AND*", "OR*"]);
+        assert_eq!(fts_tokens("AND OR"), Vec::<String>::new()); // FTS5 keywords are dropped
+        assert_eq!(fts_tokens("NOT NEAR"), Vec::<String>::new());
+        // keywords mixed with real terms — keywords are stripped, terms kept
+        assert_eq!(fts_tokens("syntax error near \"*\""), vec!["syntax*", "error*"]);
         assert_eq!(fts_tokens("\"quoted\""), vec!["quoted*"]);
         assert!(fts_tokens("  ").is_empty());
     }
