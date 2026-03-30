@@ -1,7 +1,7 @@
 use crate::config::{self, resolve_scrooge_dir};
 use crate::db::{self, facts, stats};
 use crate::format;
-use crate::hooks::{self, HookInput};
+use crate::hooks::{self, HookInput, HookOutput};
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::io::Read;
@@ -122,8 +122,14 @@ pub fn cmd_hook(event: String) -> Result<()> {
     });
 
     let output = match event.as_str() {
-        "prompt" => hooks::prompt::handle(&input)?,
-        "stop"   => hooks::stop::handle(&input)?,
+        "prompt" => hooks::prompt::handle(&input).unwrap_or_else(|e| {
+            eprintln!("scrooge hook error: {e}");
+            HookOutput::allow()
+        }),
+        "stop"   => hooks::stop::handle(&input).unwrap_or_else(|e| {
+            eprintln!("scrooge hook error: {e}");
+            HookOutput::allow()
+        }),
         other    => bail!("Unknown hook event: {}", other),
     };
 

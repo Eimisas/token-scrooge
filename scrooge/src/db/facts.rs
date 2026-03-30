@@ -336,6 +336,10 @@ fn fts_tokens(query: &str) -> Vec<String> {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
+            // Strip leading dashes (e.g. CLI flags `--stat`, `-v`).
+            // A token starting with `-` followed by `*` is invalid FTS5 and
+            // triggers "syntax error near *".
+            let clean = clean.trim_start_matches('-');
             if clean.is_empty() { return None; }
             if FTS5_KEYWORDS.contains(&clean.to_ascii_lowercase().as_str()) { return None; }
             Some(format!("{}*", clean))
@@ -449,6 +453,9 @@ mod tests {
         assert_eq!(fts_tokens("syntax error near \"*\""), vec!["syntax*", "error*"]);
         assert_eq!(fts_tokens("\"quoted\""), vec!["quoted*"]);
         assert!(fts_tokens("  ").is_empty());
+        // CLI flags: leading dashes are stripped to avoid invalid FTS5 like `-*` / `--stat*`
+        assert_eq!(fts_tokens("git --stat -v"), vec!["git*", "stat*", "v*"]);
+        assert!(fts_tokens("---").is_empty()); // bare dashes → empty → dropped
     }
 
     #[test]
