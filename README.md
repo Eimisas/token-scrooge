@@ -13,7 +13,7 @@ Scrooge fixes that. It watches your sessions, extracts what matters, and injects
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Eimisas/scrooge/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Eimisas/scrooge/master/install.sh | bash
 ```
 
 Or build from source:

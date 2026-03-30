@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ─── Token Scrooge installer ──────────────────────────────────────────────────
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Eimisas/scrooge/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Eimisas/scrooge/master/install.sh | bash
 #   OR: bash install.sh   (from a local clone)
 
 BINARY_NAME="scrooge"
