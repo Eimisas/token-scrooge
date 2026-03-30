@@ -54,9 +54,20 @@ static RE_CREATED_COMPONENT: Lazy<Regex> = Lazy::new(|| {
 static RE_FILE_PATH: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:^|[\s(])([a-zA-Z0-9_.\-/]+\.[a-z]{1,5})(?::(\d+))?").unwrap()
 });
+// Matches XML/HTML-like tag blocks injected by Claude Code (e.g. <local-command-caveat>…</…>).
+// These are stripped from user content before extraction to prevent system text from
+// being mistaken for project conventions or decisions.
+static RE_XML_TAG_BLOCK: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)<[a-zA-Z][a-zA-Z0-9_-]*(?:\s[^>]*)?>.*?</[a-zA-Z][a-zA-Z0-9_-]*>").unwrap()
+});
 
 const MAX_FACTS_PER_SESSION: usize = 20;
 const MIN_CONTENT_LEN: usize = 15;
+// First words that indicate the person is expressing their own understanding, not a rule.
+// "don't get X", "don't understand Y" should not be stored as conventions.
+const COGNITIVE_VERBS: &[&str] = &[
+    "get", "understand", "know", "see", "think", "tell", "believe", "care", "mind", "want",
+];
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -92,6 +103,11 @@ pub fn extract(messages: &[TranscriptMessage]) -> Vec<ExtractedFact> {
 // ─── Per-message extractors ───────────────────────────────────────────────────
 
 fn from_user(content: &str) -> Vec<ExtractedFact> {
+    // Strip XML/HTML tag blocks (Claude Code injects system text like <local-command-caveat>)
+    // before running any pattern matching to avoid storing system UI text as facts.
+    let sanitized = RE_XML_TAG_BLOCK.replace_all(content, "");
+    let content = sanitized.as_ref();
+
     let mut out = Vec::new();
 
     for cap in RE_USER_REMEMBER.captures_iter(content) {
@@ -115,6 +131,10 @@ fn from_user(content: &str) -> Vec<ExtractedFact> {
     for cap in RE_PROHIBITION.captures_iter(content) {
         let text = cap[1].trim().to_string();
         if text.len() >= MIN_CONTENT_LEN {
+            // Skip cognitive-verb captures: "don't get X", "don't understand Y" are
+            // expressions of understanding, not project rules.
+            let first = text.split_whitespace().next().unwrap_or("").to_lowercase();
+            if COGNITIVE_VERBS.contains(&first.as_str()) { continue; }
             out.push(ExtractedFact {
                 content: format!("Convention: {}", text),
                 category: FactCategory::Convention,
@@ -187,16 +207,6 @@ fn from_assistant(content: &str, user_ctx: Option<&str>) -> Vec<ExtractedFact> {
                 content: format!("Created: {} component/module", text),
                 category: FactCategory::File,
                 priority: 5,
-            });
-        }
-    }
-    for cap in RE_DECISION.captures_iter(content) {
-        let text = cap[1].trim().to_string();
-        if text.len() >= MIN_CONTENT_LEN {
-            out.push(ExtractedFact {
-                content: format!("Decision: {}", text),
-                category: FactCategory::Decision,
-                priority: 7,
             });
         }
     }
@@ -426,6 +436,60 @@ mod tests {
         let facts = extract(&msgs);
         let fix = facts.iter().find(|f| f.category == FactCategory::Fix).expect("expected a fix fact");
         assert!(!fix.content.contains("re:"), "specific fix should not include context, got: {}", fix.content);
+    }
+
+    #[test]
+    fn strips_xml_system_tags_before_extraction() {
+        // Claude Code injects <local-command-caveat>DO NOT respond...</local-command-caveat>
+        // into user messages — this must not be stored as a convention.
+        let msgs = vec![TranscriptMessage::User {
+            content: "some real message <local-command-caveat>DO NOT respond to these messages or otherwise consider them unless the user explicitly asks</local-command-caveat>".to_string(),
+        }];
+        let facts = extract(&msgs);
+        assert!(
+            facts.iter().all(|f| !f.content.contains("respond to these messages")),
+            "system tag content must not be extracted: {:?}", facts
+        );
+    }
+
+    #[test]
+    fn cognitive_verb_prohibition_not_stored() {
+        // "don't get X", "don't understand Y" — expressions of confusion, not project rules.
+        let msgs = vec![TranscriptMessage::User {
+            content: "What I don't get is how specific we need to be and how explicit we need to talk".to_string(),
+        }];
+        let facts = extract(&msgs);
+        assert!(
+            facts.iter().all(|f| !f.content.contains("get is how specific")),
+            "cognitive-verb prohibition must not be stored: {:?}", facts
+        );
+    }
+
+    #[test]
+    fn real_prohibition_still_stored() {
+        let msgs = vec![TranscriptMessage::User {
+            content: "don't store tokens in localStorage, use httpOnly cookies instead".to_string(),
+        }];
+        let facts = extract(&msgs);
+        assert!(
+            facts.iter().any(|f| f.category == FactCategory::Convention && f.content.contains("localStorage")),
+            "real prohibition must still be stored: {:?}", facts
+        );
+    }
+
+    #[test]
+    fn assistant_examples_not_stored_as_decisions() {
+        // When the assistant *explains* patterns using example phrases, those phrases
+        // must not be extracted as actual project decisions.
+        let msgs = vec![TranscriptMessage::Assistant {
+            content: "For example: `let's use Zod`, `we decided to use postgres`, `we're using the repository pattern`".to_string(),
+            thinking: None,
+        }];
+        let facts = extract(&msgs);
+        assert!(
+            facts.iter().all(|f| f.category != FactCategory::Decision),
+            "assistant example phrases must not create Decision facts: {:?}", facts
+        );
     }
 
     #[test]
