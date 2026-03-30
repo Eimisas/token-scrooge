@@ -77,6 +77,8 @@ scrooge expire [--days N] [--dry-run]  # archive stale facts
 scrooge gain                            # token savings report
 scrooge config show                     # print resolved config
 scrooge config init [--force]           # write default config.toml
+scrooge uninstall                       # delete .scrooge/ for this project
+scrooge uninstall --global              # also remove hooks from ~/.claude/settings.json
 ```
 
 **`setup` vs `init`**: `setup` installs the hooks into `~/.claude/settings.json` — do this once. `init` opts a specific project in by creating `.scrooge/memory.db` — the hooks only activate for projects that have been initialised.

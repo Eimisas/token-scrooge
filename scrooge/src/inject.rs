@@ -87,7 +87,6 @@ fn inject_event_hook(
 }
 
 /// Remove all scrooge hooks from settings.json (for uninstall).
-#[allow(dead_code)]
 pub fn remove_hooks() -> Result<()> {
     let settings_path = settings_json_path()?;
     if !settings_path.exists() {

@@ -63,6 +63,12 @@ pub enum Commands {
     Setup,
     /// Initialise memory DB for this project without launching Claude
     Init,
+    /// Remove scrooge hooks and delete the local memory DB
+    Uninstall {
+        /// Also remove the global hooks from ~/.claude/settings.json
+        #[arg(long)]
+        global: bool,
+    },
     /// Manage per-project configuration
     Config {
         #[command(subcommand)]
@@ -271,6 +277,28 @@ pub fn cmd_init() -> Result<()> {
     maybe_gitignore(&cwd)?;
     println!("Initialised: {}", db.display());
     println!("Run `scrooge setup` once to install the hooks globally.");
+    Ok(())
+}
+
+pub fn cmd_uninstall(global: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let scrooge_dir = resolve_scrooge_dir(&cwd);
+
+    // Remove local .scrooge/ directory
+    if scrooge_dir.exists() {
+        std::fs::remove_dir_all(&scrooge_dir)?;
+        println!("Removed: {}", scrooge_dir.display());
+    } else {
+        println!("Nothing to remove: {} does not exist", scrooge_dir.display());
+    }
+
+    if global {
+        crate::inject::remove_hooks()?;
+        println!("Removed scrooge hooks from ~/.claude/settings.json");
+    } else {
+        println!("Hooks left intact. Run `scrooge uninstall --global` to remove them too.");
+    }
+
     Ok(())
 }
 

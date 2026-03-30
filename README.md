@@ -37,6 +37,8 @@ Manual memory control:
 scrooge remember "we use JWT in httpOnly cookies"   # save a fact
 scrooge recall "authentication"                      # search memory
 scrooge forget <id>                                  # remove a fact
+scrooge uninstall                                    # remove this project's memory
+scrooge uninstall --global                           # also remove hooks
 ```
 
 ---

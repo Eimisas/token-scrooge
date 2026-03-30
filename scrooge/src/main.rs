@@ -30,6 +30,7 @@ fn main() -> Result<()> {
         Some(Commands::Gain)                                            => cli::cmd_gain(),
         Some(Commands::Setup)                                           => cli::cmd_setup(),
         Some(Commands::Init)                                            => cli::cmd_init(),
+        Some(Commands::Uninstall { global })                            => cli::cmd_uninstall(global),
         Some(Commands::Config { action })                               => cli::cmd_config(action),
         None => {
             use clap::CommandFactory;
