@@ -11,14 +11,15 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fact {
-    pub id: String,
-    pub session_id: String,
-    pub project_path: String,
-    pub content: String,
-    pub category: FactCategory,
-    pub created_at: DateTime<Utc>,
+    pub id:            String,
+    pub session_id:    String,
+    pub project_path:  String,
+    pub content:       String,
+    pub category:      FactCategory,
+    pub created_at:    DateTime<Utc>,
     pub last_accessed: Option<DateTime<Utc>>,
-    pub access_count: i64,
+    pub access_count:  i64,
+    pub archived_at:   Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +61,20 @@ impl FactCategory {
 pub struct SearchResult {
     pub fact: Fact,
     pub rank: f64,
+}
+
+/// Scoring parameters passed into `search` so the DB layer stays decoupled from hook config.
+#[derive(Debug, Clone)]
+pub struct SearchOptions {
+    pub category_weights:   crate::config::CategoryWeights,
+    pub recency_decay_days: f64,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        let cfg = crate::config::ScroogeConfig::default();
+        Self { category_weights: cfg.category_weights, recency_decay_days: cfg.recency_decay_days }
+    }
 }
 
 // ─── Operations ───────────────────────────────────────────────────────────────
@@ -111,69 +126,58 @@ pub fn insert(
     Ok(id)
 }
 
-/// Search facts with FTS5 BM25 ranking. Falls back to recency order when query is empty.
+/// Search facts with FTS5 BM25 ranking. When query is empty, returns scored fallback
+/// ranked by category weight × recency × access count using `opts`.
 pub fn search(
     conn: &Connection,
     project_root: &Path,
     query: &str,
     limit: usize,
+    opts: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
     let project_path = canonical_project_path(project_root);
 
     if query.trim().is_empty() {
+        let now = Utc::now();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, project_path, content, category,
-                    created_at, last_accessed, access_count
+                    created_at, last_accessed, access_count, archived_at
              FROM facts
              WHERE project_path = ?1
-             ORDER BY created_at DESC
+               AND archived_at  IS NULL
              LIMIT ?2",
         )?;
-        let facts = stmt
-            .query_map(params![project_path, limit as i64], row_to_fact)?
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(facts
+        let fetch_limit = (limit * 4) as i64;
+        let mut results: Vec<SearchResult> = stmt
+            .query_map(params![project_path, fetch_limit], row_to_fact)?
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|f| SearchResult { rank: 0.0, fact: f })
-            .collect());
+            .map(|f| {
+                let score = crate::scoring::category_weight(&f.category, &opts.category_weights)
+                    * crate::scoring::recency_factor(f.created_at, now, opts.recency_decay_days)
+                    * crate::scoring::access_boost(f.access_count);
+                SearchResult { rank: score, fact: f }
+            })
+            .collect();
+        results.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        return Ok(results);
     }
 
-    let safe_query = sanitize_fts_query(query);
-    if safe_query.is_empty() {
+    let tokens = fts_tokens(query);
+    if tokens.is_empty() {
         return Ok(vec![]);
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.session_id, f.project_path, f.content, f.category,
-                f.created_at, f.last_accessed, f.access_count,
-                fts.rank
-         FROM   facts_fts fts
-         JOIN   facts f ON f.rowid = fts.rowid
-         WHERE  facts_fts MATCH ?1
-           AND  f.project_path = ?2
-         ORDER  BY fts.rank
-         LIMIT  ?3",
-    )?;
+    // Try AND semantics first (precise); fall back to OR if no results (broader)
+    let and_query = tokens.join(" AND ");
+    let results = run_fts_query(conn, &and_query, &project_path, limit)?;
+    if !results.is_empty() {
+        return Ok(results);
+    }
 
-    let results = stmt
-        .query_map(params![safe_query, project_path, limit as i64], |row| {
-            let fact = Fact {
-                id:           row.get(0)?,
-                session_id:   row.get(1)?,
-                project_path: row.get(2)?,
-                content:      row.get(3)?,
-                category:     FactCategory::from_str(&row.get::<_, String>(4)?),
-                created_at:   ts_to_dt(row.get(5)?),
-                last_accessed: row.get::<_, Option<i64>>(6)?.map(ts_to_dt),
-                access_count: row.get(7)?,
-            };
-            // FTS5 rank is negative — negate so higher = better
-            let rank: f64 = -row.get::<_, f64>(8)?;
-            Ok(SearchResult { fact, rank })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(results)
+    let or_query = tokens.join(" OR ");
+    run_fts_query(conn, &or_query, &project_path, limit)
 }
 
 /// Delete a fact by ID. Returns true if a row was actually deleted.
@@ -203,6 +207,7 @@ pub fn record_access_batch(conn: &Connection, ids: &[String]) -> Result<()> {
 }
 
 /// Count total facts stored for a project.
+#[allow(dead_code)]
 pub fn count(conn: &Connection, project_root: &Path) -> Result<i64> {
     let project_path = canonical_project_path(project_root);
     Ok(conn.query_row(
@@ -212,18 +217,103 @@ pub fn count(conn: &Connection, project_root: &Path) -> Result<i64> {
     )?)
 }
 
+/// Archive facts inactive for more than `threshold_days`.
+/// Uses `last_accessed` when set, otherwise `created_at`.
+/// Returns the IDs of newly-archived facts.
+pub fn archive_facts_older_than(
+    conn: &Connection,
+    project_root: &Path,
+    threshold_days: i64,
+) -> Result<Vec<String>> {
+    let project_path = canonical_project_path(project_root);
+    let cutoff = Utc::now().timestamp() - threshold_days * 86_400;
+    let now    = Utc::now().timestamp();
+
+    let mut stmt = conn.prepare(
+        "SELECT id FROM facts
+         WHERE  project_path = ?1
+           AND  archived_at  IS NULL
+           AND  COALESCE(last_accessed, created_at) < ?2",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![project_path, cutoff], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    if ids.is_empty() {
+        return Ok(ids);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    for id in &ids {
+        tx.execute(
+            "UPDATE facts SET archived_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(ids)
+}
+
+/// Restore an archived fact by clearing its `archived_at` timestamp.
+/// Returns `true` if the fact was found and unarchived.
+#[allow(dead_code)]
+pub fn unarchive_fact(conn: &Connection, id: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE facts SET archived_at = NULL WHERE id = ?1 AND archived_at IS NOT NULL",
+        params![id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Like `search` but also returns archived facts.
+/// Archived facts have `fact.archived_at.is_some()`.
+pub fn search_including_archived(
+    conn: &Connection,
+    project_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let project_path = canonical_project_path(project_root);
+
+    if query.trim().is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_path, content, category,
+                    created_at, last_accessed, access_count, archived_at
+             FROM facts
+             WHERE project_path = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let facts = stmt
+            .query_map(params![project_path, limit as i64], row_to_fact)?
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(facts.into_iter().map(|f| SearchResult { rank: 0.0, fact: f }).collect());
+    }
+
+    let tokens = fts_tokens(query);
+    if tokens.is_empty() { return Ok(vec![]); }
+
+    let and_query = tokens.join(" AND ");
+    let results = run_fts_query_all(conn, &and_query, &project_path, limit)?;
+    if !results.is_empty() { return Ok(results); }
+
+    let or_query = tokens.join(" OR ");
+    run_fts_query_all(conn, &or_query, &project_path, limit)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     Ok(Fact {
-        id:           row.get(0)?,
-        session_id:   row.get(1)?,
-        project_path: row.get(2)?,
-        content:      row.get(3)?,
-        category:     FactCategory::from_str(&row.get::<_, String>(4)?),
-        created_at:   ts_to_dt(row.get(5)?),
+        id:            row.get(0)?,
+        session_id:    row.get(1)?,
+        project_path:  row.get(2)?,
+        content:       row.get(3)?,
+        category:      FactCategory::from_str(&row.get::<_, String>(4)?),
+        created_at:    ts_to_dt(row.get(5)?),
         last_accessed: row.get::<_, Option<i64>>(6)?.map(ts_to_dt),
-        access_count: row.get(7)?,
+        access_count:  row.get(7)?,
+        archived_at:   row.get::<_, Option<i64>>(8)?.map(ts_to_dt),
     })
 }
 
@@ -231,9 +321,9 @@ fn ts_to_dt(ts: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(ts, 0).unwrap_or_default()
 }
 
-/// Sanitise a user query for safe FTS5 MATCH expressions.
-/// Each whitespace-separated token becomes a prefix search (token*).
-fn sanitize_fts_query(query: &str) -> String {
+/// Tokenise a query into safe FTS5 prefix-search terms (`token*`).
+/// Returns an empty Vec if no valid tokens exist.
+fn fts_tokens(query: &str) -> Vec<String> {
     query
         .split_whitespace()
         .filter_map(|w| {
@@ -241,14 +331,70 @@ fn sanitize_fts_query(query: &str) -> String {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
-            if clean.is_empty() {
-                None
-            } else {
-                Some(format!("{}*", clean))
-            }
+            if clean.is_empty() { None } else { Some(format!("{}*", clean)) }
         })
-        .collect::<Vec<_>>()
-        .join(" OR ")  // OR semantics: any matching term triggers inclusion, ranked by BM25
+        .collect()
+}
+
+/// Execute a single FTS5 MATCH query, excluding archived facts.
+fn run_fts_query(
+    conn: &Connection,
+    fts_expr: &str,
+    project_path: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    run_fts_query_inner(conn, fts_expr, project_path, limit, false)
+}
+
+/// Execute a single FTS5 MATCH query, including archived facts.
+fn run_fts_query_all(
+    conn: &Connection,
+    fts_expr: &str,
+    project_path: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    run_fts_query_inner(conn, fts_expr, project_path, limit, true)
+}
+
+fn run_fts_query_inner(
+    conn: &Connection,
+    fts_expr: &str,
+    project_path: &str,
+    limit: usize,
+    include_archived: bool,
+) -> Result<Vec<SearchResult>> {
+    let archived_clause = if include_archived { "" } else { "AND  f.archived_at  IS NULL" };
+    let sql = format!(
+        "SELECT f.id, f.session_id, f.project_path, f.content, f.category,
+                f.created_at, f.last_accessed, f.access_count, f.archived_at,
+                fts.rank
+         FROM   facts_fts fts
+         JOIN   facts f ON f.rowid = fts.rowid
+         WHERE  facts_fts MATCH ?1
+           AND  f.project_path = ?2
+           {archived_clause}
+         ORDER  BY fts.rank
+         LIMIT  ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let result = stmt.query_map(params![fts_expr, project_path, limit as i64], |row| {
+        let fact = Fact {
+            id:            row.get(0)?,
+            session_id:    row.get(1)?,
+            project_path:  row.get(2)?,
+            content:       row.get(3)?,
+            category:      FactCategory::from_str(&row.get::<_, String>(4)?),
+            created_at:    ts_to_dt(row.get(5)?),
+            last_accessed: row.get::<_, Option<i64>>(6)?.map(ts_to_dt),
+            access_count:  row.get(7)?,
+            archived_at:   row.get::<_, Option<i64>>(8)?.map(ts_to_dt),
+        };
+        // FTS5 rank is negative — negate so higher = better
+        let rank: f64 = -row.get::<_, f64>(9)?;
+        Ok(SearchResult { fact, rank })
+    })?
+    .collect::<Result<Vec<_>, _>>();
+    result.map_err(Into::into)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -272,7 +418,7 @@ mod tests {
         insert(&conn, "s1", project, "Auth uses JWT tokens in httpOnly cookies", FactCategory::Decision).unwrap();
         insert(&conn, "s1", project, "Bug fixed: null pointer in LoginForm.tsx line 203", FactCategory::Fix).unwrap();
 
-        let results = search(&conn, project, "login bug", 5).unwrap();
+        let results = search(&conn, project, "login bug", 5, &SearchOptions::default()).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].fact.content.contains("LoginForm"));
     }
@@ -288,11 +434,37 @@ mod tests {
     }
 
     #[test]
-    fn fts_query_sanitization() {
-        assert_eq!(sanitize_fts_query("login bug"), "login* OR bug*");
-        assert_eq!(sanitize_fts_query("AND OR"), "AND* OR OR*");
-        assert_eq!(sanitize_fts_query("\"quoted\""), "quoted*");
-        assert_eq!(sanitize_fts_query("  "), "");
+    fn fts_tokenisation() {
+        assert_eq!(fts_tokens("login bug"), vec!["login*", "bug*"]);
+        assert_eq!(fts_tokens("AND OR"), vec!["AND*", "OR*"]);
+        assert_eq!(fts_tokens("\"quoted\""), vec!["quoted*"]);
+        assert!(fts_tokens("  ").is_empty());
+    }
+
+    #[test]
+    fn search_uses_and_when_results_exist() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+        // Only this fact matches BOTH "login" AND "bug"
+        insert(&conn, "s1", project, "login bug fix in auth flow", FactCategory::Fix).unwrap();
+        // This fact only matches "login" — should NOT appear under AND semantics
+        insert(&conn, "s1", project, "login session handling", FactCategory::Convention).unwrap();
+
+        let results = search(&conn, project, "login bug", 5, &SearchOptions::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].fact.content.contains("bug"));
+    }
+
+    #[test]
+    fn search_falls_back_to_or_when_and_yields_nothing() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+        // No fact matches both "login" AND "database" — OR fallback should return both
+        insert(&conn, "s1", project, "login session handling convention", FactCategory::Convention).unwrap();
+        insert(&conn, "s1", project, "database migration strategy", FactCategory::Decision).unwrap();
+
+        let results = search(&conn, project, "login database", 5, &SearchOptions::default()).unwrap();
+        assert_eq!(results.len(), 2);
     }
 
     #[test]
@@ -302,5 +474,96 @@ mod tests {
         let id = insert(&conn, "s1", project, "Fact to delete soon", FactCategory::Context).unwrap();
         assert!(delete(&conn, &id).unwrap());
         assert!(!delete(&conn, &id).unwrap()); // second delete is a no-op
+    }
+
+    #[test]
+    fn archive_fact_excludes_from_search() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+        let id = insert(&conn, "s1", project, "Old gRPC convention we follow", FactCategory::Convention).unwrap();
+        // Force last_accessed to 200 days ago
+        let old_ts = Utc::now().timestamp() - 200 * 86_400;
+        conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
+
+        let archived = archive_facts_older_than(&conn, project, 180).unwrap();
+        assert_eq!(archived, vec![id.clone()]);
+
+        // Regular search must hide the archived fact
+        let results = search(&conn, project, "gRPC", 10, &SearchOptions::default()).unwrap();
+        assert!(results.is_empty(), "archived facts must be hidden from search");
+
+        // search_including_archived must still find it
+        let all = search_including_archived(&conn, project, "gRPC", 10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].fact.archived_at.is_some());
+    }
+
+    #[test]
+    fn archive_respects_threshold() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+        // Recent fact — should NOT be archived
+        insert(&conn, "s1", project, "Recent convention not to be archived", FactCategory::Convention).unwrap();
+        let archived = archive_facts_older_than(&conn, project, 180).unwrap();
+        assert!(archived.is_empty(), "recently accessed fact must not be archived");
+    }
+
+    #[test]
+    fn unarchive_restores_to_search() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+        let id = insert(&conn, "s1", project, "Convention to restore later", FactCategory::Convention).unwrap();
+        let old_ts = Utc::now().timestamp() - 200 * 86_400;
+        conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
+        archive_facts_older_than(&conn, project, 180).unwrap();
+
+        assert!(unarchive_fact(&conn, &id).unwrap());
+        let results = search(&conn, project, "restore", 10, &SearchOptions::default()).unwrap();
+        assert_eq!(results.len(), 1, "unarchived fact must reappear in regular search");
+    }
+
+    #[test]
+    fn empty_query_excludes_archived() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+        let id = insert(&conn, "s1", project, "Old convention to archive", FactCategory::Convention).unwrap();
+        let old_ts = Utc::now().timestamp() - 200 * 86_400;
+        conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
+        archive_facts_older_than(&conn, project, 180).unwrap();
+
+        let results = search(&conn, project, "", 10, &SearchOptions::default()).unwrap();
+        assert!(results.is_empty(), "empty-query must not return archived facts");
+    }
+
+    #[test]
+    fn empty_query_ranks_convention_above_file() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+
+        // File fact: created now, zero accesses
+        insert(&conn, "s1", project, "src/utils/helpers.ts utility exports", FactCategory::File).unwrap();
+
+        // Convention fact: 10 days old, accessed 10 times
+        let cid = insert(&conn, "s1", project, "always use snake_case for Rust modules", FactCategory::Convention).unwrap();
+        let old_ts = Utc::now().timestamp() - 10 * 86_400;
+        conn.execute("UPDATE facts SET created_at = ?1, access_count = 10 WHERE id = ?2", params![old_ts, cid]).unwrap();
+
+        let results = search(&conn, project, "", 10, &SearchOptions::default()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].fact.category, FactCategory::Convention,
+            "convention with accesses must rank above file fact");
+    }
+
+    #[test]
+    fn empty_query_scored_fallback_excludes_archived() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+        let id = insert(&conn, "s1", project, "archived old convention", FactCategory::Convention).unwrap();
+        let old_ts = Utc::now().timestamp() - 200 * 86_400;
+        conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
+        archive_facts_older_than(&conn, project, 180).unwrap();
+
+        let results = search(&conn, project, "", 10, &SearchOptions::default()).unwrap();
+        assert!(results.is_empty(), "archived facts must be excluded from empty-query scored fallback");
     }
 }

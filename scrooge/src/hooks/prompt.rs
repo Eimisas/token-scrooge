@@ -1,13 +1,14 @@
-use crate::config::{db_path, resolve_scrooge_dir};
+use crate::config::{db_path, load_config, resolve_scrooge_dir};
 use crate::db::{self, facts, sessions, stats};
 use crate::format;
 use crate::hooks::{HookInput, HookOutput};
 use anyhow::Result;
+use chrono::Utc;
+use std::collections::HashSet;
 use std::path::Path;
 
-const MAX_INJECTED_FACTS: usize = 4;
-/// Minimum BM25 rank (after negation) to include a fact. Filters noise.
-const MIN_RANK: f64 = 0.0; // BM25 negated — any positive score counts
+/// Minimum BM25 rank (after negation) to include a candidate.
+const MIN_RANK: f64 = 0.0;
 
 pub fn handle(input: &HookInput) -> Result<HookOutput> {
     let prompt = match &input.prompt {
@@ -25,24 +26,49 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     }
 
     let conn = db::open(&scrooge_dir)?;
+    let cfg = load_config(&scrooge_dir).unwrap_or_default();
 
     // Ensure session row exists
     sessions::start(&conn, &input.session_id, cwd_path)?;
 
-    // BM25 search
-    let results = facts::search(&conn, cwd_path, &prompt, MAX_INJECTED_FACTS)?;
-    let relevant: Vec<_> = results.into_iter().filter(|r| r.rank >= MIN_RANK).collect();
+    // Load already-seen fact IDs for this session to avoid repeating injections
+    let seen = load_seen(&scrooge_dir, &input.session_id);
 
-    if relevant.is_empty() {
+    // Fetch more candidates than needed so re-ranking has room to work
+    let opts = facts::SearchOptions {
+        category_weights:   cfg.category_weights.clone(),
+        recency_decay_days: cfg.recency_decay_days,
+    };
+    let results = facts::search(&conn, cwd_path, &prompt, cfg.candidate_fetch, &opts)?;
+
+    // Filter noise, exclude already-seen, apply category-weighted re-ranking
+    let max_inject = cfg.max_injected_facts;
+    let now = Utc::now();
+    let mut ranked: Vec<_> = results
+        .into_iter()
+        .filter(|r| r.rank >= MIN_RANK && !seen.contains(r.fact.id.as_str()))
+        .map(|r| {
+            let score = r.rank
+                * crate::scoring::category_weight(&r.fact.category, &cfg.category_weights)
+                * crate::scoring::recency_factor(r.fact.created_at, now, cfg.recency_decay_days)
+                * crate::scoring::access_boost(r.fact.access_count);
+            (score, r)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let selected: Vec<_> = ranked.into_iter().take(max_inject).map(|(_, r)| r).collect();
+
+    if selected.is_empty() {
         return Ok(HookOutput::allow());
     }
 
-    // Bump access stats
-    let ids: Vec<String> = relevant.iter().map(|r| r.fact.id.clone()).collect();
+    // Persist injected IDs so subsequent messages in this session skip them
+    let ids: Vec<String> = selected.iter().map(|r| r.fact.id.clone()).collect();
+    save_seen(&scrooge_dir, &input.session_id, &ids);
     facts::record_access_batch(&conn, &ids)?;
 
     // Build context string and record stats
-    let fact_refs: Vec<&crate::db::facts::Fact> = relevant.iter().map(|r| &r.fact).collect();
+    let fact_refs: Vec<&crate::db::facts::Fact> = selected.iter().map(|r| &r.fact).collect();
     let context = format::memory_context(&fact_refs);
     let tokens_injected = stats::estimate_tokens(&context);
     let tokens_before   = stats::estimate_tokens(&prompt);
@@ -52,11 +78,46 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
         &input.session_id,
         tokens_before,
         tokens_injected,
-        relevant.len() as i64,
+        selected.len() as i64,
     )?;
 
     Ok(HookOutput::allow_with_context("UserPromptSubmit", context))
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Path to the per-session seen-file that tracks already-injected fact IDs.
+fn seen_file(scrooge_dir: &Path, session_id: &str) -> std::path::PathBuf {
+    scrooge_dir.join(format!("session-{}.seen", session_id))
+}
+
+/// Load the set of fact IDs already injected in this session.
+fn load_seen(scrooge_dir: &Path, session_id: &str) -> HashSet<String> {
+    let path = seen_file(scrooge_dir, session_id);
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Append newly-injected fact IDs to the session seen-file.
+fn save_seen(scrooge_dir: &Path, session_id: &str, ids: &[String]) {
+    let path = seen_file(scrooge_dir, session_id);
+    // Best-effort: ignore write errors (seen-file is an optimisation, not critical)
+    if let Ok(mut content) = std::fs::read_to_string(&path) {
+        for id in ids {
+            content.push_str(id);
+            content.push('\n');
+        }
+        let _ = std::fs::write(&path, content);
+    } else {
+        let _ = std::fs::write(&path, ids.join("\n") + "\n");
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -73,15 +134,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn injects_relevant_fact() {
-        let dir     = TempDir::new().unwrap();
+    fn setup_project(dir: &TempDir) -> (std::path::PathBuf, rusqlite::Connection) {
         let project = dir.path().join("proj");
         std::fs::create_dir(&project).unwrap();
-        // Create .git so find_project_root anchors here instead of falling back to ~/.scrooge
         std::fs::create_dir(project.join(".git")).unwrap();
         let scrooge = project.join(".scrooge");
-        let conn    = open(&scrooge).unwrap();
+        let conn = open(&scrooge).unwrap();
+        (project, conn)
+    }
+
+    #[test]
+    fn injects_relevant_fact() {
+        let dir = TempDir::new().unwrap();
+        let (project, conn) = setup_project(&dir);
 
         insert(&conn, "s0", &project, "Auth uses JWT tokens in httpOnly cookies", FactCategory::Decision).unwrap();
 
@@ -102,5 +167,25 @@ mod tests {
         let input = make_input(&dir.path().to_string_lossy(), "anything");
         let output = handle(&input).unwrap();
         assert!(output.hook_specific_output.is_none());
+    }
+
+    // Note: category_weight, recency_factor, and access_boost are tested in scoring.rs
+
+    #[test]
+    fn same_fact_not_injected_twice_in_session() {
+        let dir = TempDir::new().unwrap();
+        let (project, conn) = setup_project(&dir);
+
+        insert(&conn, "s0", &project, "JWT auth tokens convention always use httpOnly", FactCategory::Convention).unwrap();
+
+        let input = make_input(&project.to_string_lossy(), "JWT auth tokens");
+
+        // First call — should inject
+        let out1 = handle(&input).unwrap();
+        assert!(out1.hook_specific_output.is_some(), "first call should inject");
+
+        // Second call in same session — fact already seen, should not inject again
+        let out2 = handle(&input).unwrap();
+        assert!(out2.hook_specific_output.is_none(), "second call should skip already-seen fact");
     }
 }

@@ -1,4 +1,4 @@
-use crate::config::resolve_scrooge_dir;
+use crate::config::{load_config, resolve_scrooge_dir};
 use crate::db::{self, facts, sessions};
 use crate::extract::{heuristic, transcript};
 use crate::hooks::{HookInput, HookOutput};
@@ -14,7 +14,16 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     let cwd = input.cwd.as_deref().unwrap_or(".");
     let cwd_path = Path::new(cwd);
     let scrooge_dir = resolve_scrooge_dir(cwd_path);
+
+    // Only run if the project has been explicitly set up with `scrooge setup` or `scrooge claude`.
+    // This prevents creating .scrooge/ in projects the user never opted in.
+    use crate::config::db_path;
+    if !db_path(&scrooge_dir).exists() {
+        return Ok(HookOutput::allow());
+    }
+
     let conn = db::open(&scrooge_dir)?;
+    let cfg = load_config(&scrooge_dir).unwrap_or_default();
 
     // Resolve the transcript path
     let transcript_path = input
@@ -53,6 +62,21 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
         facts_count,
         tokens_injected,
     )?;
+
+    // Auto-archive stale facts — non-fatal; a failure must never block Claude.
+    match facts::archive_facts_older_than(&conn, cwd_path, cfg.archive_after_days) {
+        Ok(ids) if !ids.is_empty() => {
+            if std::env::var("SCROOGE_DEBUG").is_ok() {
+                eprintln!("[scrooge] auto-archived {} stale fact(s)", ids.len());
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[scrooge] warning: auto-archive failed: {}", e),
+    }
+
+    // Clean up the session seen-file now that the session has ended
+    let seen_path = scrooge_dir.join(format!("session-{}.seen", input.session_id));
+    let _ = std::fs::remove_file(&seen_path);
 
     Ok(HookOutput::allow())
 }

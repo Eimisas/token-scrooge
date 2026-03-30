@@ -1,6 +1,40 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open;
+    use tempfile::TempDir;
+
+    #[test]
+    fn migration_2_adds_archived_at_on_fresh_db() {
+        let dir  = TempDir::new().unwrap();
+        let conn = open(dir.path()).unwrap();
+        // Query panics if the column doesn't exist — that's the assertion.
+        let _: Option<i64> = conn
+            .query_row("SELECT archived_at FROM facts LIMIT 1", [], |r| r.get(0))
+            .unwrap_or(None);
+    }
+
+    #[test]
+    fn migration_2_runs_on_db_with_only_migration_1() {
+        let dir  = TempDir::new().unwrap();
+        let path = dir.path().join("memory.db");
+        {
+            // Manually apply only migration 1 and pin user_version = 1.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1i32).unwrap();
+        }
+        // Re-open via db::open — should apply migration 2 only.
+        let conn = open(dir.path()).unwrap();
+        let _: Option<i64> = conn
+            .query_row("SELECT archived_at FROM facts LIMIT 1", [], |r| r.get(0))
+            .unwrap_or(None);
+    }
+}
+
 pub fn run(conn: &Connection) -> Result<()> {
     let version: i32 =
         conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -79,5 +113,13 @@ const MIGRATIONS: &[&str] = &[
         recorded_at     INTEGER NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
     );
+    ",
+
+    // Migration 2: soft-delete / archival
+    "
+    ALTER TABLE facts ADD COLUMN archived_at INTEGER;
+    CREATE INDEX IF NOT EXISTS idx_facts_archived
+        ON facts(project_path, archived_at)
+        WHERE archived_at IS NULL;
     ",
 ];

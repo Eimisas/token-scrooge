@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum TranscriptMessage {
     User      { content: String },
     Assistant { content: String, thinking: Option<String> },
@@ -14,6 +15,7 @@ pub enum TranscriptMessage {
 }
 
 /// Parse a JSONL transcript file. Skips unparseable lines gracefully.
+#[allow(dead_code)]
 pub fn parse(path: &Path) -> Result<Vec<TranscriptMessage>> {
     let raw = fs::read_to_string(path)?;
     let mut messages = Vec::new();

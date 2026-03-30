@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// JSON payload received on stdin for every hook event.
 #[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
 pub struct HookInput {
     pub session_id:              String,
     pub transcript_path:         Option<String>,

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Session {
     pub id: String,
     pub project_path: String,
@@ -45,6 +46,7 @@ pub fn end(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn list(conn: &Connection, project_root: &Path, limit: usize) -> Result<Vec<Session>> {
     let project_path = canonical_project_path(project_root);
     let mut stmt = conn.prepare(
@@ -71,6 +73,7 @@ pub fn list(conn: &Connection, project_root: &Path, limit: usize) -> Result<Vec<
     Ok(sessions)
 }
 
+#[allow(dead_code)]
 fn ts_to_dt(ts: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(ts, 0).unwrap_or_default()
 }
