@@ -3,7 +3,6 @@ use crate::db::{self, facts, sessions, stats};
 use crate::format;
 use crate::hooks::{HookInput, HookOutput};
 use anyhow::Result;
-use chrono::Utc;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -38,38 +37,44 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     // Load already-seen fact IDs for this session to avoid repeating injections
     let seen = load_seen(&scrooge_dir, &input.session_id);
 
-    // Fetch more candidates than needed so re-ranking has room to work
+    // Fetch more candidates than needed so re-ranking and semantic deduplication have room to work
     let opts = facts::SearchOptions {
         category_weights:   cfg.category_weights.clone(),
         recency_decay_days: cfg.recency_decay_days,
         query_embedding:    query_embedding.clone(),
     };
-    let results = facts::search(&conn, cwd_path, &prompt, cfg.candidate_fetch, &opts)?;
+    // Fetch 2x the limit to allow room for deduplication
+    let results = facts::search(&conn, cwd_path, &prompt, cfg.max_injected_facts * 2, &opts)?;
 
-    // Filter noise, exclude already-seen, apply category-weighted re-ranking
-    let max_inject = cfg.max_injected_facts;
-    let now = Utc::now();
-    let mut ranked: Vec<_> = results
-        .into_iter()
-        .filter(|r| r.rank >= MIN_RANK && !seen.contains(r.fact.id.as_str()))
-        .map(|r| {
-            let mut semantic_boost = 1.0;
-            if let (Some(q_emb), Some(f_emb)) = (&query_embedding, &r.fact.embedding) {
-                let similarity = crate::embeddings::cosine_similarity(q_emb, f_emb);
-                // Boost is 1.0 to 2.0 based on similarity
-                semantic_boost = 1.0 + similarity.max(0.0);
+    // Filter noise, exclude already-seen, and perform SEMANTIC DEDUPLICATION
+    let mut selected: Vec<facts::SearchResult> = Vec::new();
+    for r in results {
+        if r.rank < MIN_RANK || seen.contains(r.fact.id.as_str()) {
+            continue;
+        }
+
+        // Check if this candidate is too similar to something already selected
+        let mut is_duplicate = false;
+        if let Some(cand_emb) = &r.fact.embedding {
+            for existing in &selected {
+                if let Some(existing_emb) = &existing.fact.embedding {
+                    let sim = crate::embeddings::cosine_similarity(cand_emb, existing_emb);
+                    if sim > 0.70 { // Lowered from 0.80 to be more aggressive against duplicates
+                        is_duplicate = true;
+                        break;
+                    }
+                }
             }
+        }
 
-            let score = r.rank
-                * crate::scoring::category_weight(&r.fact.category, &cfg.category_weights)
-                * crate::scoring::recency_factor(r.fact.created_at, now, cfg.recency_decay_days)
-                * crate::scoring::access_boost(r.fact.access_count)
-                * (semantic_boost as f64);
-            (score, r)
-        })
-        .collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let selected: Vec<_> = ranked.into_iter().take(max_inject).map(|(_, r)| r).collect();
+        if !is_duplicate {
+            selected.push(r);
+        }
+
+        if selected.len() >= cfg.max_injected_facts {
+            break;
+        }
+    }
 
     if selected.is_empty() {
         return Ok(HookOutput::allow());

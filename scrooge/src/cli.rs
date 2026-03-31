@@ -172,10 +172,18 @@ pub fn cmd_forget(id: String) -> Result<()> {
 pub fn cmd_recall(query: String, limit: usize, include_archived: bool) -> Result<()> {
     let cwd  = std::env::current_dir()?;
     let conn = db::open(&resolve_scrooge_dir(&cwd))?;
+
+    let model = crate::embeddings::EmbeddingModel::load().ok();
+    let query_embedding = model.and_then(|m| m.embed(&query).ok());
+
     let results = if include_archived {
         facts::search_including_archived(&conn, &cwd, &query, limit)?
     } else {
-        facts::search(&conn, &cwd, &query, limit, &facts::SearchOptions::default())?
+        let opts = facts::SearchOptions {
+            query_embedding,
+            ..facts::SearchOptions::default()
+        };
+        facts::search(&conn, &cwd, &query, limit, &opts)?
     };
     if results.is_empty() {
         println!("No facts found for: {}", query);

@@ -114,7 +114,6 @@ pub fn insert(
     }
 
     // --- Fact Compaction (Semantic Deduplication) ---
-    // If we have an embedding, check if a semantically near-identical fact already exists.
     if let Some(new_vec) = embedding {
         let mut stmt = conn.prepare(
             "SELECT id, embedding FROM facts 
@@ -133,9 +132,7 @@ pub fn insert(
         for res in existing {
             if let Ok((id, old_vec)) = res {
                 let sim = crate::embeddings::cosine_similarity(new_vec, &old_vec);
-                if sim > 0.92 {
-                    // It's effectively the same information. 
-                    // Update access stats instead of inserting a duplicate.
+                if sim > 0.75 {
                     record_access_batch(conn, &[id.clone()])?;
                     return Ok(id);
                 }
@@ -181,9 +178,9 @@ pub fn search(
     opts: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
     let project_path = canonical_project_path(project_root);
+    let now = Utc::now();
 
     if query.trim().is_empty() {
-        let now = Utc::now();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, project_path, content, category,
                     created_at, last_accessed, access_count, archived_at,
@@ -217,13 +214,58 @@ pub fn search(
 
     // Try AND semantics first (precise); fall back to OR if no results (broader)
     let and_query = tokens.join(" AND ");
-    let results = run_fts_query(conn, &and_query, &project_path, limit)?;
-    if !results.is_empty() {
-        return Ok(results);
+    let mut results = run_fts_query(conn, &and_query, &project_path, limit * 2)?;
+    if results.is_empty() {
+        let or_query = tokens.join(" OR ");
+        results = run_fts_query(conn, &or_query, &project_path, limit * 2)?;
     }
 
-    let or_query = tokens.join(" OR ");
-    run_fts_query(conn, &or_query, &project_path, limit)
+    // --- Semantic Recovery (Fallback for keyword misses) ---
+    // If we have few results or keyword misses, scan the 50 most recent facts semantically.
+    if let Some(q_emb) = &opts.query_embedding {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_path, content, category,
+                    created_at, last_accessed, access_count, archived_at,
+                    NULL, embedding
+             FROM facts
+             WHERE project_path = ?1 AND archived_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT 50",
+        )?;
+        let seen_ids: std::collections::HashSet<_> = results.iter().map(|r| r.fact.id.clone()).collect();
+        let fallback_facts = stmt.query_map(params![project_path], row_to_fact)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for f in fallback_facts {
+            if seen_ids.contains(&f.id) { continue; }
+            if let Some(f_emb) = &f.embedding {
+                let similarity = crate::embeddings::cosine_similarity(q_emb, f_emb);
+                if similarity > 0.6 { // Minimum semantic threshold for recovery
+                    results.push(SearchResult { rank: 0.0, fact: f });
+                }
+            }
+        }
+    }
+
+    // Apply full re-ranking: (BM25 + SemanticBoost) * weights * recency * access
+    for r in &mut results {
+        let mut semantic_score = 0.0;
+        if let (Some(q_emb), Some(f_emb)) = (&opts.query_embedding, &r.fact.embedding) {
+            let similarity = crate::embeddings::cosine_similarity(q_emb, f_emb);
+            // We ADD semantic similarity to the rank instead of multiplying by it.
+            // This ensures a 0 BM25 score (keyword miss) can still rank high.
+            semantic_score = (similarity.max(0.0) as f64) * 15.0; // Scaled to compete with BM25
+        }
+
+        r.rank = (r.rank + semantic_score)
+            * crate::scoring::category_weight(&r.fact.category, &opts.category_weights)
+            * crate::scoring::recency_factor(r.fact.created_at, now, opts.recency_decay_days)
+            * crate::scoring::access_boost(r.fact.access_count);
+    }
+
+    results.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
 }
 
 /// Delete a fact by ID. Returns true if a row was actually deleted.

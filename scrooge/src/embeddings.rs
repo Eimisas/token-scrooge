@@ -2,7 +2,7 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use hf_hub::{api::sync::ApiBuilder, Repo};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 pub struct EmbeddingModel {
@@ -14,10 +14,11 @@ pub struct EmbeddingModel {
 impl EmbeddingModel {
     pub fn load() -> Result<Self> {
         let device = Device::Cpu;
-        let repo = Repo::model("sentence-transformers/all-MiniLM-L6-v2".to_string());
+        let repo = Repo::new("sentence-transformers/all-MiniLM-L6-v2".to_string(), RepoType::Model);
         
         let cache_dir = crate::config::global_scrooge_dir()?.join("models");
         let api = ApiBuilder::new()
+            .with_endpoint("https://huggingface.co".to_string())
             .with_cache_dir(cache_dir)
             .build()?
             .repo(repo);
