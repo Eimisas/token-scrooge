@@ -49,7 +49,7 @@ These facts are stored immediately, categorised as decisions or conventions, and
 scrooge recall "authentication"    # search what's stored
 scrooge recall ""                  # list everything
 scrooge forget <id>                # remove a bad or stale fact
-scrooge gain                       # token savings report
+scrooge --savings                       # token savings report
 ```
 
 ---
