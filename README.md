@@ -2,17 +2,9 @@
 
 <p align="center"><img src="scrooge.png" alt="Token Scrooge" width="180"/></p>
 
-> Zero-setup persistent memory for Claude Code.
+> Persistent memory for Claude Code. Stop re-explaining yourself every session.
 
-Every session starts blank. You re-explain your stack, your conventions, your past decisions — again. Scrooge fixes that. It watches your sessions, extracts what matters, and injects it silently before Claude reads your next message.
-
----
-
-## Why Scrooge?
-
-*   **Stop Repeating Yourself:** Never explain your auth flow, CSS conventions, or "the way we do things here" twice.
-*   **30–50% Token Savings:** Persistent memory reduces the need for long context-setting messages. Combined with [RTK](https://github.com/rtk-ai/rtk), it's the most aggressive way to cut your bill.
-*   **Zero-Overhead Memory:** No LLM calls for extraction. No external vector DBs. No latency. Just a local SQLite file and a pure-Rust semantic engine.
+Every session starts blank. You re-explain your stack, your conventions, your past decisions — again. Scrooge fixes that by storing facts in a local SQLite database and injecting the relevant ones silently before Claude reads your next message.
 
 ---
 
@@ -37,23 +29,38 @@ scrooge init         # opt this project in (creates DB, no Claude launch)
 scrooge claude       # use instead of `claude` — memory is automatic
 ```
 
-Manual memory control:
+---
+
+## The right way to use it
+
+**Explicit memory is reliable. Use it for anything that matters:**
 
 ```bash
-scrooge remember "we use JWT in httpOnly cookies"   # save a fact
-scrooge recall "authentication"                      # search memory
-scrooge forget <id>                                  # remove a fact
-scrooge uninstall                                    # remove this project's memory
-scrooge uninstall --global                           # also remove hooks
+scrooge remember "we use Zustand for state management"
+scrooge remember "auth uses httpOnly cookies, not localStorage"
+scrooge remember "handlers must stay thin — business logic goes in services"
+```
+
+These facts are stored immediately, categorised as decisions or conventions, and injected in future sessions when relevant. This is the primary workflow.
+
+**Auto-extraction is a passive bonus.** After each session ends, Scrooge scans the transcript with heuristic patterns and tries to capture decisions, fixes, and file changes automatically. It works well for structured phrases ("let's use X", "we decided to Y", "I've fixed Z in file.rs") and for tracking which files were created or modified. It won't catch everything, and occasionally it catches noise — treat it as a convenience, not a guarantee.
+
+```bash
+scrooge recall "authentication"    # search what's stored
+scrooge recall ""                  # list everything
+scrooge forget <id>                # remove a bad or stale fact
+scrooge gain                       # token savings report
 ```
 
 ---
 
 ## How it works
 
-Before each message, your prompt is matched against stored facts using **Hybrid Search** (BM25 keyword matching + Semantic Vector similarity). The best matches are re-ranked by type (conventions score highest), relevance, recency, and usage frequency — then injected as invisible context before Claude sees your prompt.
+**Injection (before each prompt):** Your prompt is matched against stored facts using hybrid search — BM25 keyword matching combined with semantic vector similarity (local BERT model, no API calls). Matches are re-ranked by category (conventions and decisions score highest), recency, and usage frequency. The top results are injected as invisible context before Claude reads your message.
 
-After each session, the transcript is scanned with heuristic regex to extract decisions, conventions, and fixes automatically. Scrooge **compacts memory semantically**, deduplicating similar facts to ensure your context stays high-signal and low-noise.
+**Extraction (after each session):** The transcript is scanned with regex heuristics to extract facts automatically. When a new decision or convention is semantically similar to an existing one (cosine similarity > 0.75), the old fact is archived and the new one takes its place — so switching from Redux to Zustand correctly supersedes the old fact rather than accumulating contradictions.
+
+**Storage:** Per-project SQLite database at `.scrooge/memory.db`. Facts older than 180 days without access are archived automatically. Everything stays local.
 
 ---
 

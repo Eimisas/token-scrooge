@@ -22,7 +22,7 @@ static RE_DECISION: Lazy<Regex> = Lazy::new(|| {
 });
 // Natural phrasings developers use when choosing a tool/approach
 static RE_LETS_USE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?:let'?s|let us)\s+(?:use|go with|stick with|keep using)\s+(.{5,150})").unwrap()
+    Regex::new(r"(?i)(?:let'?s|let us)\s+(?:use|go with|stick with|keep using|switch to|move to|migrate to)\s+(.{5,150})").unwrap()
 });
 // "we're using / we use / we'll use X for Y"
 static RE_WE_USE: Lazy<Regex> = Lazy::new(|| {
@@ -67,6 +67,7 @@ const MIN_CONTENT_LEN: usize = 15;
 // "don't get X", "don't understand Y" should not be stored as conventions.
 const COGNITIVE_VERBS: &[&str] = &[
     "get", "understand", "know", "see", "think", "tell", "believe", "care", "mind", "want",
+    "need", "have", "like", "worry", "say",
 ];
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -135,6 +136,16 @@ fn from_user(content: &str) -> Vec<ExtractedFact> {
             // expressions of understanding, not project rules.
             let first = text.split_whitespace().next().unwrap_or("").to_lowercase();
             if COGNITIVE_VERBS.contains(&first.as_str()) { continue; }
+            // Skip transient instructions to the assistant: "do not change any code for
+            // now", "never mind just do X". A convention is a single, permanent clause;
+            // if the capture spans multiple sentences or contains "for now" / "just do"
+            // it is almost certainly an in-session directive, not a project rule.
+            let lc = text.to_lowercase();
+            if lc.contains("for now") || lc.contains("just do") || lc.contains("just use") {
+                continue;
+            }
+            // Multi-sentence captures (containing ". " mid-text) are instructions, not rules.
+            if text.contains(". ") { continue; }
             out.push(ExtractedFact {
                 content: format!("Convention: {}", text),
                 category: FactCategory::Convention,
@@ -365,6 +376,28 @@ mod tests {
     }
 
     #[test]
+    fn extracts_switch_to_pattern() {
+        let msgs = vec![TranscriptMessage::User {
+            content: "Actually, let's switch to Zustand instead of Redux. It's simpler.".to_string(),
+        }];
+        let facts = extract(&msgs);
+        assert!(facts.iter().any(|f| f.category == FactCategory::Decision && f.content.contains("Zustand")),
+            "expected Decision fact containing 'Zustand', got: {:?}", facts);
+    }
+
+    #[test]
+    fn cognitive_verb_need_not_stored() {
+        let msgs = vec![TranscriptMessage::User {
+            content: "we don't need the Redux overhead for this simple app".to_string(),
+        }];
+        let facts = extract(&msgs);
+        assert!(
+            facts.iter().all(|f| !f.content.contains("need the Redux")),
+            "cognitive verb 'need' must filter this prohibition: {:?}", facts
+        );
+    }
+
+    #[test]
     fn extracts_we_use_pattern() {
         let msgs = vec![TranscriptMessage::User {
             content: "we're using the repository pattern for all data access".to_string(),
@@ -474,6 +507,31 @@ mod tests {
         assert!(
             facts.iter().any(|f| f.category == FactCategory::Convention && f.content.contains("localStorage")),
             "real prohibition must still be stored: {:?}", facts
+        );
+    }
+
+    #[test]
+    fn transient_instruction_not_stored_as_convention() {
+        // "do not change any code for now" is an instruction to the assistant, not a rule.
+        let msgs = vec![TranscriptMessage::User {
+            content: "Do not change any code for now. Just do a critical evaluation and come up with an answer.".to_string(),
+        }];
+        let facts = extract(&msgs);
+        assert!(
+            facts.iter().all(|f| !f.content.contains("change any code")),
+            "transient instruction must not be stored as convention: {:?}", facts
+        );
+    }
+
+    #[test]
+    fn multi_sentence_prohibition_not_stored() {
+        let msgs = vec![TranscriptMessage::User {
+            content: "never mind the old approach. Just do a critical evaluation first.".to_string(),
+        }];
+        let facts = extract(&msgs);
+        assert!(
+            facts.iter().all(|f| f.category != FactCategory::Convention || !f.content.contains("mind the old")),
+            "multi-sentence prohibition must not be stored: {:?}", facts
         );
     }
 

@@ -115,24 +115,47 @@ pub fn insert(
 
     // --- Fact Compaction (Semantic Deduplication) ---
     if let Some(new_vec) = embedding {
-        let mut stmt = conn.prepare(
-            "SELECT id, embedding FROM facts 
+        // Collect into an owned Vec before doing any writes. rusqlite does not allow
+        // a prepared statement (and its borrow on `conn`) to remain open while another
+        // operation mutates the same connection, so we fully consume the query first.
+        let mut sim_stmt = conn.prepare(
+            "SELECT id, embedding, category FROM facts
              WHERE project_path = ?1 AND archived_at IS NULL AND embedding IS NOT NULL",
         )?;
-        let existing = stmt.query_map(params![project_path], |row| {
-            let id: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let vec = blob
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                .collect::<Vec<f32>>();
-            Ok((id, vec))
-        })?;
+        let existing: Vec<(String, Vec<f32>, String)> = sim_stmt
+            .query_map(params![project_path], |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                let cat: String = row.get(2)?;
+                let vec = blob
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect::<Vec<f32>>();
+                Ok((id, vec, cat))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(sim_stmt); // release the borrow on `conn` before any write below
 
-        for res in existing {
-            if let Ok((id, old_vec)) = res {
-                let sim = crate::embeddings::cosine_similarity(new_vec, &old_vec);
-                if sim > 0.75 {
+        for (id, old_vec, old_cat_str) in existing {
+            let sim = crate::embeddings::cosine_similarity(new_vec, &old_vec);
+            if sim > 0.75 {
+                let old_cat = FactCategory::from_str(&old_cat_str);
+                let both_mutable =
+                    matches!(category, FactCategory::Decision | FactCategory::Convention)
+                    && matches!(old_cat, FactCategory::Decision | FactCategory::Convention);
+
+                if both_mutable {
+                    // The new fact supersedes the old one: archive the old entry so the
+                    // fresher decision/convention wins. Fall through to insert below.
+                    let now_ts = Utc::now().timestamp();
+                    conn.execute(
+                        "UPDATE facts SET archived_at = ?1 WHERE id = ?2",
+                        params![now_ts, id],
+                    )?;
+                    break;
+                } else {
+                    // Non-mutable categories (fix, file, context, user): treat as
+                    // duplicate and bump access count instead of inserting again.
                     record_access_batch(conn, &[id.clone()])?;
                     return Ok(id);
                 }
@@ -635,6 +658,61 @@ mod tests {
 
         let results = search(&conn, project, "", 10, &SearchOptions::default()).unwrap();
         assert!(results.is_empty(), "empty-query must not return archived facts");
+    }
+
+    #[test]
+    fn decision_supersedes_similar_old_decision() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+
+        // Simulate embeddings: two vectors with >0.75 cosine similarity.
+        // We use identical vectors (similarity = 1.0) to guarantee the threshold fires.
+        let old_emb: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+        let new_emb: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+
+        let old_id = insert(&conn, "s1", project, "we use Redux for state management",
+            FactCategory::Decision, Some(&old_emb)).unwrap();
+
+        // New decision supersedes the old one.
+        let new_id = insert(&conn, "s2", project, "we use Zustand for state management",
+            FactCategory::Decision, Some(&new_emb)).unwrap();
+
+        assert_ne!(old_id, new_id, "supersede must insert a fresh fact, not return the old id");
+
+        // Old fact must be archived.
+        let archived_at: Option<i64> = conn.query_row(
+            "SELECT archived_at FROM facts WHERE id = ?1",
+            params![old_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert!(archived_at.is_some(), "superseded fact must be archived");
+
+        // New fact must appear in regular search.
+        let results = search(&conn, project, "state management", 5, &SearchOptions::default()).unwrap();
+        assert!(results.iter().any(|r| r.fact.id == new_id), "new fact must be searchable");
+        assert!(results.iter().all(|r| r.fact.id != old_id), "superseded fact must be hidden");
+    }
+
+    #[test]
+    fn fix_merges_instead_of_superseding() {
+        let (_dir, conn) = test_db();
+        let project = Path::new("/test/project");
+
+        let emb: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+
+        let old_id = insert(&conn, "s1", project, "Fixed null pointer in auth/refresh.ts",
+            FactCategory::Fix, Some(&emb)).unwrap();
+        let returned_id = insert(&conn, "s2", project, "Fixed null pointer in auth/refresh.ts again",
+            FactCategory::Fix, Some(&emb)).unwrap();
+
+        assert_eq!(old_id, returned_id, "fix dedup must return existing id, not supersede");
+
+        let archived_at: Option<i64> = conn.query_row(
+            "SELECT archived_at FROM facts WHERE id = ?1",
+            params![old_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert!(archived_at.is_none(), "fix facts must not be archived on dedup");
     }
 
     #[test]
