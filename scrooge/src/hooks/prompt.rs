@@ -28,6 +28,10 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     let conn = db::open(&scrooge_dir)?;
     let cfg = load_config(&scrooge_dir).unwrap_or_default();
 
+    // Load embedding model and embed query
+    let model = crate::embeddings::EmbeddingModel::load().ok();
+    let query_embedding = model.and_then(|m| m.embed(&prompt).ok());
+
     // Ensure session row exists
     sessions::start(&conn, &input.session_id, cwd_path)?;
 
@@ -38,6 +42,7 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     let opts = facts::SearchOptions {
         category_weights:   cfg.category_weights.clone(),
         recency_decay_days: cfg.recency_decay_days,
+        query_embedding:    query_embedding.clone(),
     };
     let results = facts::search(&conn, cwd_path, &prompt, cfg.candidate_fetch, &opts)?;
 
@@ -48,10 +53,18 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
         .into_iter()
         .filter(|r| r.rank >= MIN_RANK && !seen.contains(r.fact.id.as_str()))
         .map(|r| {
+            let mut semantic_boost = 1.0;
+            if let (Some(q_emb), Some(f_emb)) = (&query_embedding, &r.fact.embedding) {
+                let similarity = crate::embeddings::cosine_similarity(q_emb, f_emb);
+                // Boost is 1.0 to 2.0 based on similarity
+                semantic_boost = 1.0 + similarity.max(0.0);
+            }
+
             let score = r.rank
                 * crate::scoring::category_weight(&r.fact.category, &cfg.category_weights)
                 * crate::scoring::recency_factor(r.fact.created_at, now, cfg.recency_decay_days)
-                * crate::scoring::access_boost(r.fact.access_count);
+                * crate::scoring::access_boost(r.fact.access_count)
+                * (semantic_boost as f64);
             (score, r)
         })
         .collect();
@@ -148,7 +161,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (project, conn) = setup_project(&dir);
 
-        insert(&conn, "s0", &project, "Auth uses JWT tokens in httpOnly cookies", FactCategory::Decision).unwrap();
+        insert(&conn, "s0", &project, "Auth uses JWT tokens in httpOnly cookies", FactCategory::Decision, None).unwrap();
 
         let input  = make_input(&project.to_string_lossy(), "JWT auth cookies session");
         let output = handle(&input).unwrap();
@@ -176,7 +189,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (project, conn) = setup_project(&dir);
 
-        insert(&conn, "s0", &project, "JWT auth tokens convention always use httpOnly", FactCategory::Convention).unwrap();
+        insert(&conn, "s0", &project, "JWT auth tokens convention always use httpOnly", FactCategory::Convention, None).unwrap();
 
         let input = make_input(&project.to_string_lossy(), "JWT auth tokens");
 

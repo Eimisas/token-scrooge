@@ -99,6 +99,10 @@ pub fn cmd_claude(args: Vec<String>) -> Result<()> {
         db::open(&scrooge_dir)?;
         crate::inject::inject_hooks()?;
         maybe_gitignore(&cwd)?;
+        
+        eprintln!("[scrooge] Preparing local embedding model (first-time download)...");
+        let _ = crate::embeddings::EmbeddingModel::load(); 
+        
         eprintln!("[scrooge] Ready. Hooks installed in ~/.claude/settings.json");
     } else {
         // Keep hook path up-to-date (handles reinstalls)
@@ -145,7 +149,11 @@ pub fn cmd_remember(text: String, tag: Option<String>) -> Result<()> {
         .as_deref()
         .map(facts::FactCategory::from_str)
         .unwrap_or(facts::FactCategory::User);
-    let id = facts::insert(&conn, "manual", &cwd, &text, category)?;
+
+    let model = crate::embeddings::EmbeddingModel::load().ok();
+    let embedding = model.as_ref().and_then(|m| m.embed(&text).ok());
+
+    let id = facts::insert(&conn, "manual", &cwd, &text, category, embedding.as_deref())?;
     println!("Saved [{}]: {}", id, text);
     Ok(())
 }
@@ -265,6 +273,13 @@ pub fn cmd_setup() -> Result<()> {
     db::open(&scrooge_dir)?;
     crate::inject::inject_hooks()?;
     maybe_gitignore(&cwd)?;
+
+    eprintln!("[scrooge] Preparing local embedding model (first-time download)...");
+    match crate::embeddings::EmbeddingModel::load() {
+        Ok(_)  => println!("[scrooge] Model ready."),
+        Err(e) => eprintln!("[scrooge] Warning: Model pre-load failed: {}. (Will retry on use)", e),
+    }
+
     println!("Setup complete.");
     println!("  DB:    {}", crate::config::db_path(&scrooge_dir).display());
     println!("  Hooks: {}", crate::config::settings_json_path()?.display());
@@ -290,19 +305,34 @@ pub fn cmd_uninstall(global: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let scrooge_dir = resolve_scrooge_dir(&cwd);
 
-    // Remove local .scrooge/ directory
+    // Remove local project .scrooge/ directory
     if scrooge_dir.exists() {
         std::fs::remove_dir_all(&scrooge_dir)?;
-        println!("Removed: {}", scrooge_dir.display());
-    } else {
-        println!("Nothing to remove: {} does not exist", scrooge_dir.display());
+        println!("Removed project memory: {}", scrooge_dir.display());
     }
 
     if global {
         crate::inject::remove_hooks()?;
         println!("Removed scrooge hooks from ~/.claude/settings.json");
+
+        let global_dir = config::global_scrooge_dir()?;
+        if global_dir.exists() {
+            std::fs::remove_dir_all(&global_dir)?;
+            println!("Removed global memory and models: {}", global_dir.display());
+        }
+
+        let bin = config::scrooge_binary_path()?;
+        if bin.exists() {
+            // Attempt to remove the binary itself. 
+            // On some OSs this might fail if the process is running, 
+            // but usually it works or can be renamed.
+            let _ = std::fs::remove_file(&bin);
+            println!("Removed scrooge binary: {}", bin.display());
+        }
+        
+        println!("Uninstall complete.");
     } else {
-        println!("Hooks left intact. Run `scrooge uninstall --global` to remove them too.");
+        println!("Project memory removed. Run `scrooge uninstall --global` to remove hooks, models, and binary.");
     }
 
     Ok(())

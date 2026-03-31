@@ -4,9 +4,15 @@
 
 > Zero-setup persistent memory for Claude Code.
 
-Every session starts blank. You re-explain your stack, your conventions, your past decisions — again.
+Every session starts blank. You re-explain your stack, your conventions, your past decisions — again. Scrooge fixes that. It watches your sessions, extracts what matters, and injects it silently before Claude reads your next message.
 
-Scrooge fixes that. It watches your sessions, extracts what matters, and injects it silently before Claude reads your next message.
+---
+
+## Why Scrooge?
+
+*   **Stop Repeating Yourself:** Never explain your auth flow, CSS conventions, or "the way we do things here" twice.
+*   **30–50% Token Savings:** Persistent memory reduces the need for long context-setting messages. Combined with [RTK](https://github.com/rtk-ai/rtk), it's the most aggressive way to cut your bill.
+*   **Zero-Overhead Memory:** No LLM calls for extraction. No external vector DBs. No latency. Just a local SQLite file and a pure-Rust semantic engine.
 
 ---
 
@@ -45,15 +51,9 @@ scrooge uninstall --global                           # also remove hooks
 
 ## How it works
 
-Before each message, your prompt is matched against stored facts using BM25 search. The best matches are re-ranked by type (conventions score highest), recency, and usage frequency — then injected as invisible context before Claude sees your prompt.
+Before each message, your prompt is matched against stored facts using **Hybrid Search** (BM25 keyword matching + Semantic Vector similarity). The best matches are re-ranked by type (conventions score highest), relevance, recency, and usage frequency — then injected as invisible context before Claude sees your prompt.
 
-After each session, the transcript is scanned with heuristic regex to extract decisions, conventions, and fixes automatically. No model calls. Works out of the box — optional per-project config available.
-
----
-
-## Works alongside RTK
-
-[RTK](https://github.com/rtk-ai/rtk) compresses tool output. Scrooge handles session memory. Running both typically cuts **30–50% of tokens** on a typical session.
+After each session, the transcript is scanned with heuristic regex to extract decisions, conventions, and fixes automatically. Scrooge **compacts memory semantically**, deduplicating similar facts to ensure your context stays high-signal and low-noise.
 
 ---
 

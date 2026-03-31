@@ -122,4 +122,9 @@ const MIGRATIONS: &[&str] = &[
         ON facts(project_path, archived_at)
         WHERE archived_at IS NULL;
     ",
+
+    // Migration 3: semantic search embeddings
+    "
+    ALTER TABLE facts ADD COLUMN embedding BLOB;
+    ",
 ];

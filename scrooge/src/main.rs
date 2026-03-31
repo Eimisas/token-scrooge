@@ -2,6 +2,7 @@ mod analytics;
 mod cli;
 mod config;
 mod db;
+mod embeddings;
 mod error;
 mod extract;
 mod format;

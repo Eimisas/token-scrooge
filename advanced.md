@@ -4,10 +4,16 @@
 
 ```
 your prompt
-  → FTS5 BM25 search → 15 candidates
-  → re-ranked: score = bm25 × category_weight × recency × access_boost
+  → 1. FTS5 BM25 search → 15 keyword-matching candidates
+  → 2. Local Embedding (all-MiniLM-L6-v2) → query vector
+  → 3. Re-ranked: score = (bm25 + cosine_similarity_boost)
+                         × category_weight 
+                         × recency 
+                         × access_boost
   → top N injected as invisible context
 ```
+
+**Semantic Boost**: Facts with high vector similarity to the prompt get a multiplier boost (up to 2x). This allows "finding by meaning" even when keywords don't match exactly.
 
 **Category weights** (higher = injected first):
 
@@ -85,7 +91,17 @@ scrooge uninstall --global              # also remove hooks from ~/.claude/setti
 
 ---
 
-## Archival
+## Memory maintenance
+
+### 1. Fact Compaction (Semantic Deduplication)
+
+To prevent your context from becoming cluttered with redundant information, Scrooge uses a **Semantic Compaction** step during extraction. 
+
+When a new fact is extracted (e.g., "we're using Zod for validation"), Scrooge calculates its embedding and scans the existing project memory. If it finds a fact with **>0.92 cosine similarity**, it **skips the new insert** and instead increments the `access_count` and `last_accessed` timestamp of the existing fact.
+
+This keeps your memory pool refined, ensures you only inject unique pieces of information, and allows you to stay under `max_injected_facts` longer with higher-quality data.
+
+### 2. Archival
 
 Facts are soft-deleted, not hard-deleted. After a session ends, scrooge automatically archives facts not accessed in `archive_after_days` (default: 180). Archived facts are hidden from search but recoverable.
 
@@ -100,7 +116,9 @@ scrooge recall "query" --include-archived  # search including archived
 ## Storage layout
 
 ```
-~/.scrooge/memory.db              # global fallback (outside any project)
+~/.scrooge/
+  memory.db                       # global fallback (outside any project)
+  models/                         # local embedding models (all-MiniLM-L6-v2)
 <project-root>/.scrooge/
   memory.db                       # per-project facts
   config.toml                     # optional config overrides

@@ -42,8 +42,11 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     let extracted = heuristic::extract(&messages);
     let facts_count = extracted.len() as i64;
 
+    let model = crate::embeddings::EmbeddingModel::load().ok();
+
     for ef in extracted {
-        facts::insert(&conn, &input.session_id, cwd_path, &ef.content, ef.category)?;
+        let embedding = model.as_ref().and_then(|m| m.embed(&ef.content).ok());
+        facts::insert(&conn, &input.session_id, cwd_path, &ef.content, ef.category, embedding.as_deref())?;
     }
 
     // Sum tokens injected across all injections in this session
