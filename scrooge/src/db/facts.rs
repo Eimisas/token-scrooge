@@ -20,6 +20,7 @@ pub struct Fact {
     pub last_accessed: Option<DateTime<Utc>>,
     pub access_count:  i64,
     pub archived_at:   Option<DateTime<Utc>>,
+    pub embedding:     Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,12 +69,17 @@ pub struct SearchResult {
 pub struct SearchOptions {
     pub category_weights:   crate::config::CategoryWeights,
     pub recency_decay_days: f64,
+    pub query_embedding:    Option<Vec<f32>>,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
         let cfg = crate::config::ScroogeConfig::default();
-        Self { category_weights: cfg.category_weights, recency_decay_days: cfg.recency_decay_days }
+        Self {
+            category_weights: cfg.category_weights,
+            recency_decay_days: cfg.recency_decay_days,
+            query_embedding: None,
+        }
     }
 }
 
@@ -87,6 +93,7 @@ pub fn insert(
     project_root: &Path,
     content: &str,
     category: FactCategory,
+    embedding: Option<&[f32]>,
 ) -> Result<String> {
     let project_path = canonical_project_path(project_root);
 
@@ -106,8 +113,43 @@ pub fn insert(
         return Ok(existing_id);
     }
 
+    // --- Fact Compaction (Semantic Deduplication) ---
+    if let Some(new_vec) = embedding {
+        let mut stmt = conn.prepare(
+            "SELECT id, embedding FROM facts 
+             WHERE project_path = ?1 AND archived_at IS NULL AND embedding IS NOT NULL",
+        )?;
+        let existing = stmt.query_map(params![project_path], |row| {
+            let id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let vec = blob
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<f32>>();
+            Ok((id, vec))
+        })?;
+
+        for res in existing {
+            if let Ok((id, old_vec)) = res {
+                let sim = crate::embeddings::cosine_similarity(new_vec, &old_vec);
+                if sim > 0.75 {
+                    record_access_batch(conn, &[id.clone()])?;
+                    return Ok(id);
+                }
+            }
+        }
+    }
+
     let id  = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
+
+    let embedding_blob = embedding.map(|v| {
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for &f in v {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        bytes
+    });
 
     // Ensure the session row exists (FK constraint). Uses OR IGNORE so it's safe
     // even when sessions::start() has already been called from the hook.
@@ -118,9 +160,9 @@ pub fn insert(
 
     conn.execute(
         "INSERT INTO facts
-             (id, session_id, project_path, content, category, content_hash, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, session_id, project_path, content, category.as_str(), content_hash, now],
+             (id, session_id, project_path, content, category, content_hash, created_at, embedding)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, session_id, project_path, content, category.as_str(), content_hash, now, embedding_blob],
     )?;
 
     Ok(id)
@@ -136,12 +178,13 @@ pub fn search(
     opts: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
     let project_path = canonical_project_path(project_root);
+    let now = Utc::now();
 
     if query.trim().is_empty() {
-        let now = Utc::now();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, project_path, content, category,
-                    created_at, last_accessed, access_count, archived_at
+                    created_at, last_accessed, access_count, archived_at,
+                    NULL, embedding
              FROM facts
              WHERE project_path = ?1
                AND archived_at  IS NULL
@@ -171,13 +214,58 @@ pub fn search(
 
     // Try AND semantics first (precise); fall back to OR if no results (broader)
     let and_query = tokens.join(" AND ");
-    let results = run_fts_query(conn, &and_query, &project_path, limit)?;
-    if !results.is_empty() {
-        return Ok(results);
+    let mut results = run_fts_query(conn, &and_query, &project_path, limit * 2)?;
+    if results.is_empty() {
+        let or_query = tokens.join(" OR ");
+        results = run_fts_query(conn, &or_query, &project_path, limit * 2)?;
     }
 
-    let or_query = tokens.join(" OR ");
-    run_fts_query(conn, &or_query, &project_path, limit)
+    // --- Semantic Recovery (Fallback for keyword misses) ---
+    // If we have few results or keyword misses, scan the 50 most recent facts semantically.
+    if let Some(q_emb) = &opts.query_embedding {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, project_path, content, category,
+                    created_at, last_accessed, access_count, archived_at,
+                    NULL, embedding
+             FROM facts
+             WHERE project_path = ?1 AND archived_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT 50",
+        )?;
+        let seen_ids: std::collections::HashSet<_> = results.iter().map(|r| r.fact.id.clone()).collect();
+        let fallback_facts = stmt.query_map(params![project_path], row_to_fact)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for f in fallback_facts {
+            if seen_ids.contains(&f.id) { continue; }
+            if let Some(f_emb) = &f.embedding {
+                let similarity = crate::embeddings::cosine_similarity(q_emb, f_emb);
+                if similarity > 0.6 { // Minimum semantic threshold for recovery
+                    results.push(SearchResult { rank: 0.0, fact: f });
+                }
+            }
+        }
+    }
+
+    // Apply full re-ranking: (BM25 + SemanticBoost) * weights * recency * access
+    for r in &mut results {
+        let mut semantic_score = 0.0;
+        if let (Some(q_emb), Some(f_emb)) = (&opts.query_embedding, &r.fact.embedding) {
+            let similarity = crate::embeddings::cosine_similarity(q_emb, f_emb);
+            // We ADD semantic similarity to the rank instead of multiplying by it.
+            // This ensures a 0 BM25 score (keyword miss) can still rank high.
+            semantic_score = (similarity.max(0.0) as f64) * 15.0; // Scaled to compete with BM25
+        }
+
+        r.rank = (r.rank + semantic_score)
+            * crate::scoring::category_weight(&r.fact.category, &opts.category_weights)
+            * crate::scoring::recency_factor(r.fact.created_at, now, opts.recency_decay_days)
+            * crate::scoring::access_boost(r.fact.access_count);
+    }
+
+    results.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
 }
 
 /// Delete a fact by ID. Returns true if a row was actually deleted.
@@ -304,6 +392,14 @@ pub fn search_including_archived(
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
+    let embedding_blob: Option<Vec<u8>> = row.get(9).ok();
+    let embedding = embedding_blob.map(|bytes| {
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    });
+
     Ok(Fact {
         id:            row.get(0)?,
         session_id:    row.get(1)?,
@@ -314,6 +410,7 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         last_accessed: row.get::<_, Option<i64>>(6)?.map(ts_to_dt),
         access_count:  row.get(7)?,
         archived_at:   row.get::<_, Option<i64>>(8)?.map(ts_to_dt),
+        embedding,
     })
 }
 
@@ -378,7 +475,7 @@ fn run_fts_query_inner(
     let sql = format!(
         "SELECT f.id, f.session_id, f.project_path, f.content, f.category,
                 f.created_at, f.last_accessed, f.access_count, f.archived_at,
-                fts.rank
+                fts.rank, f.embedding
          FROM   facts_fts fts
          JOIN   facts f ON f.rowid = fts.rowid
          WHERE  facts_fts MATCH ?1
@@ -389,20 +486,8 @@ fn run_fts_query_inner(
     );
     let mut stmt = conn.prepare(&sql)?;
     let result = stmt.query_map(params![fts_expr, project_path, limit as i64], |row| {
-        let fact = Fact {
-            id:            row.get(0)?,
-            session_id:    row.get(1)?,
-            project_path:  row.get(2)?,
-            content:       row.get(3)?,
-            category:      FactCategory::from_str(&row.get::<_, String>(4)?),
-            created_at:    ts_to_dt(row.get(5)?),
-            last_accessed: row.get::<_, Option<i64>>(6)?.map(ts_to_dt),
-            access_count:  row.get(7)?,
-            archived_at:   row.get::<_, Option<i64>>(8)?.map(ts_to_dt),
-        };
-        // FTS5 rank is negative — negate so higher = better
         let rank: f64 = -row.get::<_, f64>(9)?;
-        Ok(SearchResult { fact, rank })
+        Ok(SearchResult { fact: row_to_fact(row).unwrap(), rank })
     })?
     .collect::<Result<Vec<_>, _>>();
     result.map_err(Into::into)
@@ -426,8 +511,8 @@ mod tests {
     fn insert_and_search() {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
-        insert(&conn, "s1", project, "Auth uses JWT tokens in httpOnly cookies", FactCategory::Decision).unwrap();
-        insert(&conn, "s1", project, "Bug fixed: null pointer in LoginForm.tsx line 203", FactCategory::Fix).unwrap();
+        insert(&conn, "s1", project, "Auth uses JWT tokens in httpOnly cookies", FactCategory::Decision, None).unwrap();
+        insert(&conn, "s1", project, "Bug fixed: null pointer in LoginForm.tsx line 203", FactCategory::Fix, None).unwrap();
 
         let results = search(&conn, project, "login bug", 5, &SearchOptions::default()).unwrap();
         assert!(!results.is_empty());
@@ -438,8 +523,8 @@ mod tests {
     fn deduplication() {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
-        let id1 = insert(&conn, "s1", project, "Same content here", FactCategory::Context).unwrap();
-        let id2 = insert(&conn, "s2", project, "Same content here", FactCategory::Context).unwrap();
+        let id1 = insert(&conn, "s1", project, "Same content here", FactCategory::Context, None).unwrap();
+        let id2 = insert(&conn, "s2", project, "Same content here", FactCategory::Context, None).unwrap();
         assert_eq!(id1, id2);
         assert_eq!(count(&conn, project).unwrap(), 1);
     }
@@ -463,9 +548,9 @@ mod tests {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
         // Only this fact matches BOTH "login" AND "bug"
-        insert(&conn, "s1", project, "login bug fix in auth flow", FactCategory::Fix).unwrap();
+        insert(&conn, "s1", project, "login bug fix in auth flow", FactCategory::Fix, None).unwrap();
         // This fact only matches "login" — should NOT appear under AND semantics
-        insert(&conn, "s1", project, "login session handling", FactCategory::Convention).unwrap();
+        insert(&conn, "s1", project, "login session handling", FactCategory::Convention, None).unwrap();
 
         let results = search(&conn, project, "login bug", 5, &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 1);
@@ -477,8 +562,8 @@ mod tests {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
         // No fact matches both "login" AND "database" — OR fallback should return both
-        insert(&conn, "s1", project, "login session handling convention", FactCategory::Convention).unwrap();
-        insert(&conn, "s1", project, "database migration strategy", FactCategory::Decision).unwrap();
+        insert(&conn, "s1", project, "login session handling convention", FactCategory::Convention, None).unwrap();
+        insert(&conn, "s1", project, "database migration strategy", FactCategory::Decision, None).unwrap();
 
         let results = search(&conn, project, "login database", 5, &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 2);
@@ -488,7 +573,7 @@ mod tests {
     fn delete_fact() {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
-        let id = insert(&conn, "s1", project, "Fact to delete soon", FactCategory::Context).unwrap();
+        let id = insert(&conn, "s1", project, "Fact to delete soon", FactCategory::Context, None).unwrap();
         assert!(delete(&conn, &id).unwrap());
         assert!(!delete(&conn, &id).unwrap()); // second delete is a no-op
     }
@@ -497,7 +582,7 @@ mod tests {
     fn archive_fact_excludes_from_search() {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
-        let id = insert(&conn, "s1", project, "Old gRPC convention we follow", FactCategory::Convention).unwrap();
+        let id = insert(&conn, "s1", project, "Old gRPC convention we follow", FactCategory::Convention, None).unwrap();
         // Force last_accessed to 200 days ago
         let old_ts = Utc::now().timestamp() - 200 * 86_400;
         conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
@@ -520,7 +605,7 @@ mod tests {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
         // Recent fact — should NOT be archived
-        insert(&conn, "s1", project, "Recent convention not to be archived", FactCategory::Convention).unwrap();
+        insert(&conn, "s1", project, "Recent convention not to be archived", FactCategory::Convention, None).unwrap();
         let archived = archive_facts_older_than(&conn, project, 180).unwrap();
         assert!(archived.is_empty(), "recently accessed fact must not be archived");
     }
@@ -529,7 +614,7 @@ mod tests {
     fn unarchive_restores_to_search() {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
-        let id = insert(&conn, "s1", project, "Convention to restore later", FactCategory::Convention).unwrap();
+        let id = insert(&conn, "s1", project, "Convention to restore later", FactCategory::Convention, None).unwrap();
         let old_ts = Utc::now().timestamp() - 200 * 86_400;
         conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
         archive_facts_older_than(&conn, project, 180).unwrap();
@@ -543,7 +628,7 @@ mod tests {
     fn empty_query_excludes_archived() {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
-        let id = insert(&conn, "s1", project, "Old convention to archive", FactCategory::Convention).unwrap();
+        let id = insert(&conn, "s1", project, "Old convention to archive", FactCategory::Convention, None).unwrap();
         let old_ts = Utc::now().timestamp() - 200 * 86_400;
         conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
         archive_facts_older_than(&conn, project, 180).unwrap();
@@ -558,10 +643,10 @@ mod tests {
         let project = Path::new("/test/project");
 
         // File fact: created now, zero accesses
-        insert(&conn, "s1", project, "src/utils/helpers.ts utility exports", FactCategory::File).unwrap();
+        insert(&conn, "s1", project, "src/utils/helpers.ts utility exports", FactCategory::File, None).unwrap();
 
         // Convention fact: 10 days old, accessed 10 times
-        let cid = insert(&conn, "s1", project, "always use snake_case for Rust modules", FactCategory::Convention).unwrap();
+        let cid = insert(&conn, "s1", project, "always use snake_case for Rust modules", FactCategory::Convention, None).unwrap();
         let old_ts = Utc::now().timestamp() - 10 * 86_400;
         conn.execute("UPDATE facts SET created_at = ?1, access_count = 10 WHERE id = ?2", params![old_ts, cid]).unwrap();
 
@@ -575,7 +660,7 @@ mod tests {
     fn empty_query_scored_fallback_excludes_archived() {
         let (_dir, conn) = test_db();
         let project = Path::new("/test/project");
-        let id = insert(&conn, "s1", project, "archived old convention", FactCategory::Convention).unwrap();
+        let id = insert(&conn, "s1", project, "archived old convention", FactCategory::Convention, None).unwrap();
         let old_ts = Utc::now().timestamp() - 200 * 86_400;
         conn.execute("UPDATE facts SET last_accessed = ?1 WHERE id = ?2", params![old_ts, id]).unwrap();
         archive_facts_older_than(&conn, project, 180).unwrap();
