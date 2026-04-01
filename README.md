@@ -1,6 +1,6 @@
 # Token Scrooge
 
-
+<p align="center"><img src="scrooge.png" alt="Token Scrooge" width="180"/></p>
 
 > Persistent memory for Claude Code. Stop re-explaining yourself every session.
 
