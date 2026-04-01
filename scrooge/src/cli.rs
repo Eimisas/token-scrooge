@@ -184,7 +184,40 @@ pub fn cmd_claude(args: Vec<String>) -> Result<()> {
         crate::inject::inject_hooks()?;
     }
 
+    // --- Automatic Daemon Management ---
+    if let Err(e) = ensure_daemon_running() {
+        eprintln!("[scrooge] Warning: Could not start memory assistant: {}", e);
+    }
+
     exec_claude(&args)
+}
+
+fn ensure_daemon_running() -> Result<()> {
+    let home = dirs::home_dir().expect("no home dir");
+    let scrooge_dir = home.join(".scrooge");
+    let socket_path = scrooge_dir.join("daemon.sock").to_string_lossy().to_string();
+    let client = crate::daemon::Client::new(&socket_path);
+
+    if !client.is_running() {
+        eprintln!("[scrooge] Starting memory assistant daemon...");
+        
+        // Ensure model is downloaded before backgrounding so we can show progress if needed
+        let cache_dir = scrooge_dir.join("models");
+        std::fs::create_dir_all(&cache_dir)?;
+        // This will trigger download if missing
+        let _ = crate::models::slm::Slm::load("Qwen/Qwen2.5-0.5B-Instruct", cache_dir)?;
+
+        let exe = std::env::current_exe()?;
+        std::process::Command::new(exe)
+            .arg("daemon")
+            .arg("start")
+            .arg("--foreground")
+            .spawn()?;
+        
+        // Brief pause to allow socket to bind
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
 }
 
 pub fn cmd_hook(event: String) -> Result<()> {
@@ -357,15 +390,17 @@ pub fn cmd_setup() -> Result<()> {
     crate::inject::inject_hooks()?;
     maybe_gitignore(&cwd)?;
 
-    eprintln!("[scrooge] Preparing local embedding model (first-time download)...");
+    eprintln!("[scrooge] Preparing memory models (this may take a minute)...");
     match crate::embeddings::EmbeddingModel::load() {
-        Ok(_)  => println!("[scrooge] Model ready."),
-        Err(e) => eprintln!("[scrooge] Warning: Model pre-load failed: {}. (Will retry on use)", e),
+        Ok(_)  => println!("[scrooge] Embeddings ready."),
+        Err(e) => eprintln!("[scrooge] Warning: Embedding pre-load failed: {}. (Will retry on use)", e),
     }
+    
+    // This will pre-download Qwen and start the daemon
+    let _ = ensure_daemon_running();
 
     println!("Setup complete.");
-    println!("  DB:    {}", crate::config::db_path(&scrooge_dir).display());
-    println!("  Hooks: {}", crate::config::settings_json_path()?.display());
+    println!("  Memory is now automatic for all sessions.");
     Ok(())
 }
 
