@@ -53,6 +53,12 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
         let req = crate::protocol::Request::Gatekeeper { transcript: text_for_slm };
         if let Ok(crate::protocol::Response::Gatekeeper { facts }) = client.send(req) {
             for ef in facts {
+                if ef.priority < cfg.min_fact_priority {
+                    if std::env::var("SCROOGE_DEBUG").is_ok() {
+                        eprintln!("[scrooge] Gatekeeper: discarding low-priority fact ({}): {}", ef.priority, &ef.content[..ef.content.len().min(60)]);
+                    }
+                    continue;
+                }
                 let category = crate::db::facts::FactCategory::from_str(&ef.category);
                 let embedding = model.as_ref().and_then(|m| m.embed(&ef.content).ok());
                 facts::insert(&conn, &input.session_id, cwd_path, &ef.content, category, embedding.as_deref())?;

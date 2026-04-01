@@ -43,15 +43,17 @@ impl Slm {
             model,
             tokenizer,
             device,
-            logits_processor: LogitsProcessor::new(1337, Some(0.7), None),
+            logits_processor: LogitsProcessor::new(1337, Some(0.1), None),
         })
     }
 
     pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String> {
-        // Simple chat template for Qwen2.5-Instruct:
-        // <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
-        let formatted_prompt = format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt);
-        
+        // Qwen2.5-Instruct chat template
+        let formatted_prompt = format!(
+            "<|im_start|>system\nYou are a precise technical assistant. Follow instructions exactly. Output only what is requested — no explanations, no prose, no markdown fences.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            prompt
+        );
+
         let tokens = self.tokenizer.encode(formatted_prompt, true).map_err(Error::msg)?;
         let mut tokens = tokens.get_ids().to_vec();
         let mut generated_text = String::new();
@@ -62,9 +64,9 @@ impl Slm {
             let logits = self.model.forward(&input, index_pos, None)?;
             let logits = logits.squeeze(0)?;
             let logits = logits.get(logits.dim(0)? - 1)?;
-
             let next_token = self.logits_processor.sample(&logits)?;
-            index_pos = tokens.len(); // Next position is the current length
+
+            index_pos = tokens.len();
             tokens.push(next_token);
 
             let decoded = self.tokenizer.decode(&[next_token], true).map_err(Error::msg)?;
