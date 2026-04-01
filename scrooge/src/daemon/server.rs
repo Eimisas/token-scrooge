@@ -33,9 +33,7 @@ impl Server {
                 Ok(mut stream) => {
                     let slm = Arc::clone(&self.slm);
                     thread::spawn(move || {
-                        if let Err(e) = handle_client(&mut stream, slm) {
-                            eprintln!("[scrooge] client error: {}", e);
-                        }
+                        let _ = handle_client(&mut stream, slm);
                     });
                 }
                 Err(e) => eprintln!("[scrooge] accept error: {}", e),
