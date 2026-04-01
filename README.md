@@ -1,6 +1,6 @@
 # Token Scrooge
 
-<p align="center"><img src="scrooge.png" alt="Token Scrooge" width="180"/></p>
+
 
 > Persistent memory for Claude Code. Stop re-explaining yourself every session.
 
@@ -11,13 +11,13 @@ Every session starts blank. You re-explain your stack, your conventions, your pa
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Eimisas/scrooge/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Eimisas/token-scrooge/master/install.sh | bash
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/Eimisas/scrooge
+git clone https://github.com/Eimisas/token-scrooge
 bash scrooge/install.sh
 ```
 

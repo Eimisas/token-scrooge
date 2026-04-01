@@ -8,7 +8,7 @@ set -euo pipefail
 
 BINARY_NAME="scrooge"
 INSTALL_DIR="${HOME}/.local/bin"
-REPO="Eimisas/scrooge"    # ← update this before publishing
+REPO="Eimisas/token-scrooge"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 info()    { echo -e "${BOLD}${GREEN}[scrooge]${NC} $*"; }
