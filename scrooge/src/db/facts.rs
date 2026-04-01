@@ -138,7 +138,7 @@ pub fn insert(
 
         for (id, old_vec, old_cat_str) in existing {
             let sim = crate::embeddings::cosine_similarity(new_vec, &old_vec);
-            if sim > 0.75 {
+            if sim > 0.85 {
                 let old_cat = FactCategory::from_str(&old_cat_str);
                 let both_mutable =
                     matches!(category, FactCategory::Decision | FactCategory::Convention)

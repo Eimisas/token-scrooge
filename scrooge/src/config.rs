@@ -81,6 +81,10 @@ pub struct ScroogeConfig {
     /// Facts inactive this many days are auto-archived.
     #[serde(default = "defaults::archive_after_days")]
     pub archive_after_days: i64,
+    /// Minimum priority (1–10) for SLM-extracted facts to be stored.
+    /// Facts below this threshold are discarded. Env var `SCROOGE_MIN_PRIORITY` overrides.
+    #[serde(default = "defaults::min_fact_priority")]
+    pub min_fact_priority: u8,
     /// Per-category scoring weights (all must be positive).
     #[serde(default)]
     pub category_weights: CategoryWeights,
@@ -118,6 +122,7 @@ impl Default for ScroogeConfig {
             candidate_fetch:    defaults::candidate_fetch(),
             recency_decay_days: defaults::recency_decay_days(),
             archive_after_days: defaults::archive_after_days(),
+            min_fact_priority:  defaults::min_fact_priority(),
             category_weights:   CategoryWeights::default(),
         }
     }
@@ -128,6 +133,7 @@ mod defaults {
     pub fn candidate_fetch()    -> usize { 15 }
     pub fn recency_decay_days() -> f64   { 90.0 }
     pub fn archive_after_days() -> i64   { 180 }
+    pub fn min_fact_priority()  -> u8    { 6 }
     pub fn w_convention()       -> f64   { 2.0 }
     pub fn w_decision()         -> f64   { 1.5 }
     pub fn w_fix()              -> f64   { 1.2 }
@@ -150,6 +156,9 @@ impl ScroogeConfig {
         }
         if self.archive_after_days <= 0 {
             anyhow::bail!("config: archive_after_days must be > 0");
+        }
+        if self.min_fact_priority < 1 || self.min_fact_priority > 10 {
+            anyhow::bail!("config: min_fact_priority must be between 1 and 10, got {}", self.min_fact_priority);
         }
         for (name, w) in [
             ("convention", self.category_weights.convention),
@@ -183,10 +192,15 @@ pub fn load_config(scrooge_dir: &Path) -> Result<ScroogeConfig> {
         ScroogeConfig::default()
     };
 
-    // Env var takes precedence over the file value.
+    // Env vars take precedence over the file value.
     if let Ok(v) = std::env::var("SCROOGE_MAX_FACTS") {
         cfg.max_injected_facts = v.parse::<usize>().map_err(|_| {
             anyhow::anyhow!("SCROOGE_MAX_FACTS must be a positive integer, got {:?}", v)
+        })?;
+    }
+    if let Ok(v) = std::env::var("SCROOGE_MIN_PRIORITY") {
+        cfg.min_fact_priority = v.parse::<u8>().map_err(|_| {
+            anyhow::anyhow!("SCROOGE_MIN_PRIORITY must be an integer 1–10, got {:?}", v)
         })?;
     }
 
@@ -212,6 +226,9 @@ recency_decay_days = {recency_decay_days}
 ## Facts inactive this many days are automatically archived
 archive_after_days = {archive_after_days}
 
+## Minimum SLM priority score (1–10) for auto-extracted facts to be stored (env: SCROOGE_MIN_PRIORITY)
+min_fact_priority = {min_fact_priority}
+
 [category_weights]
 convention = {convention}
 decision   = {decision}
@@ -224,6 +241,7 @@ file       = {file}
         candidate_fetch    = cfg.candidate_fetch,
         recency_decay_days = cfg.recency_decay_days,
         archive_after_days = cfg.archive_after_days,
+        min_fact_priority  = cfg.min_fact_priority,
         convention = cfg.category_weights.convention,
         decision   = cfg.category_weights.decision,
         fix        = cfg.category_weights.fix,

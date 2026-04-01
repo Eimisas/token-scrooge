@@ -69,6 +69,11 @@ pub enum Commands {
         #[arg(long)]
         global: bool,
     },
+    /// Manage the background scrooge daemon (required for SLM features)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonCommands,
+    },
     /// Manage per-project configuration
     Config {
         #[command(subcommand)]
@@ -88,28 +93,167 @@ pub enum ConfigCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum DaemonCommands {
+    /// Start the scrooge daemon in the background
+    Start {
+        /// Run in foreground for debugging
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the running scrooge daemon
+    Stop,
+    /// Check if the daemon is running
+    Status,
+}
+
 // ─── Command handlers ─────────────────────────────────────────────────────────
+
+pub fn cmd_daemon(action: DaemonCommands) -> Result<()> {
+    let home = dirs::home_dir().expect("no home dir");
+    let scrooge_dir = home.join(".scrooge");
+    let socket_path = scrooge_dir.join("daemon.sock").to_string_lossy().to_string();
+    let client = crate::daemon::Client::new(&socket_path);
+
+    match action {
+        DaemonCommands::Status => {
+            if client.is_running() {
+                println!("Daemon is running.");
+            } else {
+                println!("Daemon is NOT running.");
+            }
+        }
+        DaemonCommands::Stop => {
+            if client.is_running() {
+                println!("Stopping daemon...");
+                let _ = client.send(crate::protocol::Request::Shutdown);
+            } else {
+                println!("Daemon is not running.");
+            }
+        }
+        DaemonCommands::Start { foreground } => {
+            if client.is_running() {
+                println!("Daemon is already running.");
+                return Ok(());
+            }
+
+            if foreground {
+                run_daemon(&socket_path)?;
+            } else {
+                let exe = std::env::current_exe()?;
+                std::process::Command::new(exe)
+                    .arg("daemon")
+                    .arg("start")
+                    .arg("--foreground")
+                    .spawn()?;
+                println!("Daemon started in background.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_daemon(socket_path: &str) -> Result<()> {
+    let home = dirs::home_dir().expect("no home dir");
+    let cache_dir = home.join(".scrooge").join("models");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    println!("[scrooge] Loading model Qwen2.5-0.5B-Instruct...");
+    let slm = crate::models::slm::Slm::load("Qwen/Qwen2.5-0.5B-Instruct", cache_dir)?;
+    let server = crate::daemon::Server::new(slm, socket_path);
+    server.start()?;
+    Ok(())
+}
 
 pub fn cmd_claude(args: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let scrooge_dir = resolve_scrooge_dir(&cwd);
 
     if !crate::config::db_path(&scrooge_dir).exists() {
-        eprintln!("[scrooge] First run — initialising memory store at {}", scrooge_dir.display());
+        eprintln!("[scrooge] First run — initialising memory for this project.");
         db::open(&scrooge_dir)?;
-        crate::inject::inject_hooks()?;
+        let hooks_installed = crate::inject::inject_hooks()?;
         maybe_gitignore(&cwd)?;
-        
+
         eprintln!("[scrooge] Preparing local embedding model (first-time download)...");
-        let _ = crate::embeddings::EmbeddingModel::load(); 
-        
-        eprintln!("[scrooge] Ready. Hooks installed in ~/.claude/settings.json");
+        let _ = crate::embeddings::EmbeddingModel::load();
+
+        if hooks_installed {
+            eprintln!("[scrooge] Hooks installed in ~/.claude/settings.json");
+        }
+        eprintln!("[scrooge] Ready.");
     } else {
-        // Keep hook path up-to-date (handles reinstalls)
+        // Keep hook path up-to-date (handles reinstalls) and sweep orphaned session files.
         crate::inject::inject_hooks()?;
+        cleanup_stale_seen_files(&scrooge_dir);
     }
 
+    // Ensure daemon is running before handing off to claude.
+    // scrooge claude always owns the stop: when this session exits the daemon
+    // stops too. Users who want a persistent daemon across multiple sessions
+    // should use `scrooge daemon start` directly.
+    let _ = ensure_daemon_running().map_err(|e| {
+        eprintln!("[scrooge] Warning: Could not start memory assistant: {}", e);
+    });
+
     exec_claude(&args)
+}
+
+/// Start the daemon if it is not already running.
+/// Returns `true` if this call started the daemon, `false` if it was already running.
+fn ensure_daemon_running() -> Result<bool> {
+    let home = dirs::home_dir().expect("no home dir");
+    let scrooge_dir = home.join(".scrooge");
+    let socket_path = scrooge_dir.join("daemon.sock").to_string_lossy().to_string();
+    let client = crate::daemon::Client::new(&socket_path);
+
+    if client.is_running() {
+        return Ok(false); // already up — nothing to do
+    }
+
+    eprintln!("[scrooge] Starting memory assistant...");
+
+    // Pre-download the SLM so the user sees progress here rather than silence
+    // while the daemon loads in the background.
+    let cache_dir = scrooge_dir.join("models");
+    std::fs::create_dir_all(&cache_dir)?;
+    let _ = crate::models::slm::Slm::load("Qwen/Qwen2.5-0.5B-Instruct", cache_dir)?;
+
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .arg("start")
+        .arg("--foreground")
+        // Redirect daemon stdio so its internal logs don't appear in the user's
+        // terminal while Claude is running.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    // Poll until the socket is ready (model load can take a few seconds).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if client.is_running() {
+            eprintln!("[scrooge] Memory assistant ready.");
+            // Fire a minimal inference in the background so the first real hook
+            // call hits a warm JIT rather than a cold one.  The user is typing
+            // their first prompt during this window, so the latency is hidden.
+            let warmup_client = crate::daemon::Client::new(&socket_path);
+            std::thread::spawn(move || {
+                let _ = warmup_client.send(crate::protocol::Request::Librarian {
+                    prompt: "warm-up".to_string(),
+                    max_tokens: 1,
+                });
+            });
+            return Ok(true);
+        }
+    }
+
+    // Timed out — proceed without SLM features rather than blocking the user.
+    eprintln!("[scrooge] Warning: memory assistant did not start in time; SLM features disabled for this session.");
+    Ok(true) // we did spawn it, so we should attempt cleanup on exit
 }
 
 pub fn cmd_hook(event: String) -> Result<()> {
@@ -279,18 +423,26 @@ pub fn cmd_setup() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let scrooge_dir = resolve_scrooge_dir(&cwd);
     db::open(&scrooge_dir)?;
-    crate::inject::inject_hooks()?;
+    let _ = crate::inject::inject_hooks()?;
     maybe_gitignore(&cwd)?;
 
-    eprintln!("[scrooge] Preparing local embedding model (first-time download)...");
+    eprintln!("[scrooge] Downloading embedding model (this may take a minute)...");
     match crate::embeddings::EmbeddingModel::load() {
-        Ok(_)  => println!("[scrooge] Model ready."),
-        Err(e) => eprintln!("[scrooge] Warning: Model pre-load failed: {}. (Will retry on use)", e),
+        Ok(_)  => eprintln!("[scrooge] Embedding model ready."),
+        Err(e) => eprintln!("[scrooge] Warning: Embedding model download failed: {}. (Will retry on first use)", e),
     }
 
-    println!("Setup complete.");
-    println!("  DB:    {}", crate::config::db_path(&scrooge_dir).display());
-    println!("  Hooks: {}", crate::config::settings_json_path()?.display());
+    eprintln!("[scrooge] Downloading SLM (Qwen2.5-0.5B, ~350MB)...");
+    let home = dirs::home_dir().expect("no home dir");
+    let cache_dir = home.join(".scrooge").join("models");
+    std::fs::create_dir_all(&cache_dir)?;
+    match crate::models::slm::Slm::load("Qwen/Qwen2.5-0.5B-Instruct", cache_dir) {
+        Ok(_)  => eprintln!("[scrooge] SLM ready."),
+        Err(e) => eprintln!("[scrooge] Warning: SLM download failed: {}. (Will retry on first `scrooge claude`)", e),
+    }
+
+    println!("Setup complete: {}", crate::config::db_path(&scrooge_dir).display());
+    println!("  Memory is now automatic for all sessions.");
     Ok(())
 }
 
@@ -339,6 +491,7 @@ pub fn cmd_uninstall(global: bool) -> Result<()> {
         }
         
         println!("Uninstall complete.");
+        println!("Note: other projects may still have .scrooge/ directories — remove them manually if needed.");
     } else {
         println!("Project memory removed. Run `scrooge uninstall --global` to remove hooks, models, and binary.");
     }
@@ -377,19 +530,19 @@ pub fn cmd_config(action: ConfigCommands) -> Result<()> {
 
 fn exec_claude(args: &[String]) -> Result<()> {
     let claude = which_claude()?;
+    let status = std::process::Command::new(&claude).args(args).status()?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&claude).args(args).exec();
-        Err(anyhow::anyhow!("Failed to exec claude: {}", err))
+    // Always stop the daemon when this session ends. scrooge claude is the
+    // daemon's lifecycle owner. Users who want a persistent daemon use
+    // `scrooge daemon start` directly and manage it themselves.
+    let home = dirs::home_dir().expect("no home dir");
+    let socket = home.join(".scrooge").join("daemon.sock");
+    let client = crate::daemon::Client::new(&socket.to_string_lossy());
+    if client.is_running() {
+        let _ = client.send(crate::protocol::Request::Shutdown);
     }
 
-    #[cfg(not(unix))]
-    {
-        let status = std::process::Command::new(&claude).args(args).status()?;
-        std::process::exit(status.code().unwrap_or(1));
-    }
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn which_claude() -> Result<std::path::PathBuf> {
@@ -402,6 +555,29 @@ fn which_claude() -> Result<std::path::PathBuf> {
         }
     }
     bail!("claude binary not found in PATH")
+}
+
+/// Delete session `.seen` files older than 7 days from the scrooge dir.
+/// These are ephemeral and accumulate indefinitely without cleanup.
+fn cleanup_stale_seen_files(scrooge_dir: &Path) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let Ok(entries) = std::fs::read_dir(scrooge_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("session-") || !name.ends_with(".seen") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified < cutoff {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
 }
 
 fn maybe_gitignore(cwd: &Path) -> Result<()> {
