@@ -39,14 +39,36 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
 
     // Parse transcript and extract facts
     let messages  = transcript::parse_with_file_ops(Path::new(&transcript_path)).unwrap_or_default();
-    let extracted = heuristic::extract(&messages);
-    let facts_count = extracted.len() as i64;
+    
+    let home = dirs::home_dir().expect("no home dir");
+    let socket_path = home.join(".scrooge").join("daemon.sock").to_string_lossy().to_string();
+    let client = crate::daemon::Client::new(&socket_path);
 
+    let mut facts_count = 0;
     let model = crate::embeddings::EmbeddingModel::load().ok();
 
+    if client.is_running() {
+        // Send cleaned transcript to daemon for high-quality SLM extraction
+        let text_for_slm = format_transcript_for_slm(&messages);
+        let req = crate::protocol::Request::Gatekeeper { transcript: text_for_slm };
+        if let Ok(crate::protocol::Response::Gatekeeper { facts }) = client.send(req) {
+            for ef in facts {
+                let category = crate::db::facts::FactCategory::from_str(&ef.category);
+                let embedding = model.as_ref().and_then(|m| m.embed(&ef.content).ok());
+                facts::insert(&conn, &input.session_id, cwd_path, &ef.content, category, embedding.as_deref())?;
+                facts_count += 1;
+            }
+        }
+    }
+
+    // Always run heuristic extraction as a baseline or fallback
+    let extracted = heuristic::extract(&messages);
     for ef in extracted {
         let embedding = model.as_ref().and_then(|m| m.embed(&ef.content).ok());
         facts::insert(&conn, &input.session_id, cwd_path, &ef.content, ef.category, embedding.as_deref())?;
+        if !client.is_running() {
+            facts_count += 1;
+        }
     }
 
     // Sum tokens injected across all injections in this session
@@ -82,6 +104,22 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     let _ = std::fs::remove_file(&seen_path);
 
     Ok(HookOutput::allow())
+}
+
+fn format_transcript_for_slm(messages: &[transcript::TranscriptMessage]) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        match msg {
+            transcript::TranscriptMessage::User { content } => {
+                out.push_str(&format!("User: {}\n\n", content));
+            }
+            transcript::TranscriptMessage::Assistant { content, .. } => {
+                out.push_str(&format!("Assistant: {}\n\n", content));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Fallback: find the newest .jsonl in the Claude projects dir for this cwd.

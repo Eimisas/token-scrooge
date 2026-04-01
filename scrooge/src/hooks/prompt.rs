@@ -85,9 +85,45 @@ pub fn handle(input: &HookInput) -> Result<HookOutput> {
     save_seen(&scrooge_dir, &input.session_id, &ids);
     facts::record_access_batch(&conn, &ids)?;
 
-    // Build context string and record stats
     let fact_refs: Vec<&crate::db::facts::Fact> = selected.iter().map(|r| &r.fact).collect();
-    let context = format::memory_context(&fact_refs);
+    
+    // --- Librarian (SLM Reconciliation) ---
+    let home = dirs::home_dir().expect("no home dir");
+    let socket_path = home.join(".scrooge").join("daemon.sock").to_string_lossy().to_string();
+    let client = crate::daemon::Client::new(&socket_path);
+
+    let mut context = format::memory_context(&fact_refs);
+
+    if client.is_running() && selected.len() > 1 {
+        // Simple conflict trigger: high similarity or same category
+        let mut needs_reconciliation = false;
+        for i in 0..selected.len() {
+            for j in i+1..selected.len() {
+                if selected[i].fact.category == selected[j].fact.category {
+                    needs_reconciliation = true;
+                    break;
+                }
+                if let (Some(e1), Some(e2)) = (&selected[i].fact.embedding, &selected[j].fact.embedding) {
+                    if crate::embeddings::cosine_similarity(e1, e2) > 0.65 {
+                        needs_reconciliation = true;
+                        break;
+                    }
+                }
+            }
+            if needs_reconciliation { break; }
+        }
+
+        if needs_reconciliation {
+            let req = crate::protocol::Request::Librarian {
+                prompt: format!("Query: {}\n\nFacts:\n{}", prompt, context),
+                max_tokens: 150,
+            };
+            if let Ok(crate::protocol::Response::Librarian { summary }) = client.send(req) {
+                context = format!("[scrooge] Reconciled Memory:\n{}", summary);
+            }
+        }
+    }
+
     let tokens_injected = stats::estimate_tokens(&context);
     let tokens_before   = stats::estimate_tokens(&prompt);
 

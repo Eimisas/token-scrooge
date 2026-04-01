@@ -69,6 +69,11 @@ pub enum Commands {
         #[arg(long)]
         global: bool,
     },
+    /// Manage the background scrooge daemon (required for SLM features)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonCommands,
+    },
     /// Manage per-project configuration
     Config {
         #[command(subcommand)]
@@ -88,7 +93,77 @@ pub enum ConfigCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum DaemonCommands {
+    /// Start the scrooge daemon in the background
+    Start {
+        /// Run in foreground for debugging
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the running scrooge daemon
+    Stop,
+    /// Check if the daemon is running
+    Status,
+}
+
 // ─── Command handlers ─────────────────────────────────────────────────────────
+
+pub fn cmd_daemon(action: DaemonCommands) -> Result<()> {
+    let home = dirs::home_dir().expect("no home dir");
+    let scrooge_dir = home.join(".scrooge");
+    let socket_path = scrooge_dir.join("daemon.sock").to_string_lossy().to_string();
+    let client = crate::daemon::Client::new(&socket_path);
+
+    match action {
+        DaemonCommands::Status => {
+            if client.is_running() {
+                println!("Daemon is running.");
+            } else {
+                println!("Daemon is NOT running.");
+            }
+        }
+        DaemonCommands::Stop => {
+            if client.is_running() {
+                println!("Stopping daemon...");
+                let _ = client.send(crate::protocol::Request::Shutdown);
+            } else {
+                println!("Daemon is not running.");
+            }
+        }
+        DaemonCommands::Start { foreground } => {
+            if client.is_running() {
+                println!("Daemon is already running.");
+                return Ok(());
+            }
+
+            if foreground {
+                run_daemon(&socket_path)?;
+            } else {
+                let exe = std::env::current_exe()?;
+                std::process::Command::new(exe)
+                    .arg("daemon")
+                    .arg("start")
+                    .arg("--foreground")
+                    .spawn()?;
+                println!("Daemon started in background.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_daemon(socket_path: &str) -> Result<()> {
+    let home = dirs::home_dir().expect("no home dir");
+    let cache_dir = home.join(".scrooge").join("models");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    println!("[scrooge] Loading model Qwen2.5-0.5B-Instruct...");
+    let slm = crate::models::slm::Slm::load("Qwen/Qwen2.5-0.5B-Instruct", cache_dir)?;
+    let server = crate::daemon::Server::new(slm, socket_path);
+    server.start()?;
+    Ok(())
+}
 
 pub fn cmd_claude(args: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
