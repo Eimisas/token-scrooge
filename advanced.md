@@ -10,26 +10,11 @@ your prompt
                          × category_weight 
                          × recency 
                          × access_boost
-  → top N injected as invisible context
+  → 4. Librarian (Qwen2.5-0.5B) → Reconciled Context
+  → top result injected as invisible context
 ```
 
-**Semantic Boost**: Facts with high vector similarity to the prompt get a multiplier boost (up to 2x). This allows "finding by meaning" even when keywords don't match exactly.
-
-**Category weights** (higher = injected first):
-
-| Category | Weight | Captured from |
-|---|---|---|
-| `convention` | 2.0 | "from now on…", "always…", "never…", "the approach is…" |
-| `decision` | 1.5 | "we decided…", "let's go with…", "we're using…" |
-| `fix` | 1.2 | "I've fixed…", "the bug was…" |
-| `user` | 1.0 | Explicit `scrooge remember "…"` commands |
-| `context` | 1.0 | Session summary bullet points |
-| `file` | 0.5 | Files created or significantly modified |
-
-**Recency decay**: score decays linearly from 1.0 to 0.5 over 90 days.
-**Access boost**: facts retrieved often get up to 1.5× multiplier (logarithmic, capped).
-
-Empty-query fallback (no search terms) uses the same scoring formula ranked by category + recency + access count.
+**Step 4: Librarian Reconciliation**. If Scrooge finds conflicting facts (e.g. 2 "decisions" with high similarity or same category), it invokes the local SLM to summarize them into a single coherent truth. If no conflicts are found, it falls back to raw fact injection for zero latency.
 
 ---
 
@@ -42,74 +27,39 @@ scrooge config init    # write default config to .scrooge/config.toml
 scrooge config show    # print resolved config (including env overrides)
 ```
 
-```toml
-## Maximum facts injected per prompt (env: SCROOGE_MAX_FACTS)
-max_injected_facts = 4
-
-## BM25 candidates fetched before re-ranking
-candidate_fetch = 15
-
-## Days over which recency score decays from 1.0 to 0.5
-recency_decay_days = 90
-
-## Facts inactive this many days are automatically archived
-archive_after_days = 180
-
-[category_weights]
-convention = 2.0
-decision   = 1.5
-fix        = 1.2
-user       = 1.0
-context    = 1.0
-file       = 0.5
-```
-
-Partial files are supported — omitted keys use the defaults above.
-`SCROOGE_MAX_FACTS=N` env var overrides `max_injected_facts` at runtime.
-
 ---
 
 ## All CLI commands
 
 ```bash
-scrooge setup                           # install Claude Code hooks globally (once per machine)
-scrooge init                            # opt this project in — creates DB, adds .gitignore entry
-scrooge claude [args...]                # run claude with memory active
+scrooge setup                           # install Claude Code hooks and download models
+scrooge init                            # opt this project in — creates DB
+scrooge claude [args...]                # run claude with memory assistant (starts daemon)
+scrooge daemon start|stop|status        # manage the background memory assistant
 scrooge remember "text" [--tag T]      # save a fact (tags: decision|fix|file|convention|context)
 scrooge recall "query" [--limit N]     # search memory
-scrooge recall "query" --include-archived  # include archived facts
 scrooge forget <id>                     # delete a fact
 scrooge expire [--days N] [--dry-run]  # archive stale facts
 scrooge gain                            # token savings report
 scrooge config show                     # print resolved config
 scrooge config init [--force]           # write default config.toml
 scrooge uninstall                       # delete .scrooge/ for this project
-scrooge uninstall --global              # also remove hooks from ~/.claude/settings.json
+scrooge uninstall --global              # also remove hooks and local models
 ```
 
-**`setup` vs `init`**: `setup` installs the hooks into `~/.claude/settings.json` — do this once. `init` opts a specific project in by creating `.scrooge/memory.db` — the hooks only activate for projects that have been initialised.
+**Daemon**: The `scrooge daemon` manages the local SLM (Small Language Model). It is started automatically by `scrooge claude` and stays resident in memory to provide instant summarization and extraction.
 
 ---
 
 ## Memory maintenance
 
-### 1. Fact Compaction (Semantic Deduplication)
+### 1. The Gatekeeper (Structured Ingestion)
 
-To prevent your context from becoming cluttered with redundant information, Scrooge uses a **Semantic Compaction** step during extraction. 
+When a session ends, the **Gatekeeper** uses the local SLM to scan the entire transcript for high-quality technical facts. It outputs structured JSON, which allows Scrooge to archive contradicting information. For example, if a new decision to "use Vite" is found, the Gatekeeper will mark an older "use Webpack" decision as archived.
 
-When a new fact is extracted (e.g., "we're using Zod for validation"), Scrooge calculates its embedding and scans the existing project memory. If it finds a fact with **>0.92 cosine similarity**, it **skips the new insert** and instead increments the `access_count` and `last_accessed` timestamp of the existing fact.
+### 2. The Librarian (Context Reconciliation)
 
-This keeps your memory pool refined, ensures you only inject unique pieces of information, and allows you to stay under `max_injected_facts` longer with higher-quality data.
-
-### 2. Archival
-
-Facts are soft-deleted, not hard-deleted. After a session ends, scrooge automatically archives facts not accessed in `archive_after_days` (default: 180). Archived facts are hidden from search but recoverable.
-
-```bash
-scrooge expire --dry-run            # preview what would be archived
-scrooge expire --days 90            # archive facts idle for 90+ days
-scrooge recall "query" --include-archived  # search including archived
-```
+During retrieval, the **Librarian** handles the "messy" cases where multiple facts about the same topic might be injected. It ensures that Claude sees a single, consistent paragraph rather than five different fragments with different timestamps.
 
 ---
 
@@ -118,7 +68,8 @@ scrooge recall "query" --include-archived  # search including archived
 ```
 ~/.scrooge/
   memory.db                       # global fallback (outside any project)
-  models/                         # local embedding models (all-MiniLM-L6-v2)
+  models/                         # local models (Qwen2.5 + Embeddings)
+  daemon.sock                     # IPC socket for daemon communication
 <project-root>/.scrooge/
   memory.db                       # per-project facts
   config.toml                     # optional config overrides
