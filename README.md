@@ -49,7 +49,7 @@ These facts are stored immediately, and injected in future sessions when relevan
 scrooge recall "authentication"    # search what's stored
 scrooge recall ""                  # list everything
 scrooge daemon status              # check memory assistant health
-scrooge gain                       # token savings report
+scrooge --savings                  # token savings report
 ```
 
 ---
