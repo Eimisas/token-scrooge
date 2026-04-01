@@ -5,7 +5,8 @@ use std::fs;
 
 /// Inject (or update) scrooge hooks in ~/.claude/settings.json.
 /// Idempotent — safe to call on every startup.
-pub fn inject_hooks() -> Result<()> {
+/// Returns `true` if the settings file was actually modified.
+pub fn inject_hooks() -> Result<bool> {
     let settings_path = settings_json_path()?;
     let binary_path = scrooge_binary_path()?.to_string_lossy().to_string();
 
@@ -28,7 +29,7 @@ pub fn inject_hooks() -> Result<()> {
         fs::rename(&tmp, &settings_path)?;
     }
 
-    Ok(())
+    Ok(modified)
 }
 
 /// Returns true if settings were changed.

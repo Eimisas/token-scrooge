@@ -170,18 +170,22 @@ pub fn cmd_claude(args: Vec<String>) -> Result<()> {
     let scrooge_dir = resolve_scrooge_dir(&cwd);
 
     if !crate::config::db_path(&scrooge_dir).exists() {
-        eprintln!("[scrooge] First run — initialising memory store at {}", scrooge_dir.display());
+        eprintln!("[scrooge] First run — initialising memory for this project.");
         db::open(&scrooge_dir)?;
-        crate::inject::inject_hooks()?;
+        let hooks_installed = crate::inject::inject_hooks()?;
         maybe_gitignore(&cwd)?;
 
         eprintln!("[scrooge] Preparing local embedding model (first-time download)...");
         let _ = crate::embeddings::EmbeddingModel::load();
 
-        eprintln!("[scrooge] Ready. Hooks installed in ~/.claude/settings.json");
+        if hooks_installed {
+            eprintln!("[scrooge] Hooks installed in ~/.claude/settings.json");
+        }
+        eprintln!("[scrooge] Ready.");
     } else {
-        // Keep hook path up-to-date (handles reinstalls)
+        // Keep hook path up-to-date (handles reinstalls) and sweep orphaned session files.
         crate::inject::inject_hooks()?;
+        cleanup_stale_seen_files(&scrooge_dir);
     }
 
     // Ensure daemon is running before handing off to claude.
@@ -207,7 +211,7 @@ fn ensure_daemon_running() -> Result<bool> {
         return Ok(false); // already up — nothing to do
     }
 
-    eprintln!("[scrooge] Starting memory assistant (first prompt may be slower)...");
+    eprintln!("[scrooge] Starting memory assistant...");
 
     // Pre-download the SLM so the user sees progress here rather than silence
     // while the daemon loads in the background.
@@ -233,6 +237,16 @@ fn ensure_daemon_running() -> Result<bool> {
         std::thread::sleep(std::time::Duration::from_millis(200));
         if client.is_running() {
             eprintln!("[scrooge] Memory assistant ready.");
+            // Fire a minimal inference in the background so the first real hook
+            // call hits a warm JIT rather than a cold one.  The user is typing
+            // their first prompt during this window, so the latency is hidden.
+            let warmup_client = crate::daemon::Client::new(&socket_path);
+            std::thread::spawn(move || {
+                let _ = warmup_client.send(crate::protocol::Request::Librarian {
+                    prompt: "warm-up".to_string(),
+                    max_tokens: 1,
+                });
+            });
             return Ok(true);
         }
     }
@@ -409,7 +423,7 @@ pub fn cmd_setup() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let scrooge_dir = resolve_scrooge_dir(&cwd);
     db::open(&scrooge_dir)?;
-    crate::inject::inject_hooks()?;
+    let _ = crate::inject::inject_hooks()?;
     maybe_gitignore(&cwd)?;
 
     eprintln!("[scrooge] Downloading embedding model (this may take a minute)...");
@@ -477,6 +491,7 @@ pub fn cmd_uninstall(global: bool) -> Result<()> {
         }
         
         println!("Uninstall complete.");
+        println!("Note: other projects may still have .scrooge/ directories — remove them manually if needed.");
     } else {
         println!("Project memory removed. Run `scrooge uninstall --global` to remove hooks, models, and binary.");
     }
@@ -540,6 +555,29 @@ fn which_claude() -> Result<std::path::PathBuf> {
         }
     }
     bail!("claude binary not found in PATH")
+}
+
+/// Delete session `.seen` files older than 7 days from the scrooge dir.
+/// These are ephemeral and accumulate indefinitely without cleanup.
+fn cleanup_stale_seen_files(scrooge_dir: &Path) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let Ok(entries) = std::fs::read_dir(scrooge_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("session-") || !name.ends_with(".seen") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified < cutoff {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
 }
 
 fn maybe_gitignore(cwd: &Path) -> Result<()> {
