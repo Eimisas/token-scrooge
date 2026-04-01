@@ -1,6 +1,5 @@
 use anyhow::Result;
 use scrooge::models::slm::Slm;
-use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let home = dirs::home_dir().expect("no home dir");
