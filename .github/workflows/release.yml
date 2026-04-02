@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -35,7 +36,7 @@ jobs:
 
       - name: Install musl tools (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install -y musl-tools
+        run: sudo apt-get install -y musl-tools g++
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -49,6 +50,8 @@ jobs:
 
       - name: Build release binary
         working-directory: scrooge
+        env:
+          CXX_x86_64_unknown_linux_musl: g++
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
@@ -56,6 +59,7 @@ jobs:
           cp scrooge/target/${{ matrix.target }}/release/scrooge ${{ matrix.asset_name }}
 
       - name: Upload to release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.asset_name }}
